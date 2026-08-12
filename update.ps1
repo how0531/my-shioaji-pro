@@ -65,7 +65,12 @@ $want = (Get-Content "$repo\SHIOAJI_VERSION" -Raw).Trim().TrimStart('v')
 $have = ''
 $exe = (Get-Command shioaji -ErrorAction SilentlyContinue).Source
 if ($exe) {
-    $out = (& $exe version) -join "`n"
+    # shioaji 在有 .env 的目錄會往 stderr 印一行提示；PowerShell 5.1 會把原生
+    # 程式的 stderr 當成終止錯誤，所以這裡先放寬，並把 stderr 一併收進來。
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $out = (& $exe version 2>&1 | Out-String)
+    $ErrorActionPreference = $prev
     if ($out -match 'version:\s*"?([\d.]+)"?') { $have = $Matches[1] }
 }
 
