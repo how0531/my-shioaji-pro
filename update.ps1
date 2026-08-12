@@ -64,7 +64,7 @@ Step 4 "檢查後端 CLI 版本"
 $want = (Get-Content "$repo\SHIOAJI_VERSION" -Raw).Trim().TrimStart('v')
 $have = ''
 try {
-    $out = & shioaji version 2>&1 | Out-String
+    $out = & shioaji version | Out-String
     if ($out -match 'version:\s*"?([\d.]+)"?') { $have = $Matches[1] }
 } catch { }
 
