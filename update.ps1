@@ -63,10 +63,11 @@ if ($Push) {
 Step 4 "檢查後端 CLI 版本"
 $want = (Get-Content "$repo\SHIOAJI_VERSION" -Raw).Trim().TrimStart('v')
 $have = ''
-try {
-    $out = & shioaji version | Out-String
+$exe = (Get-Command shioaji -ErrorAction SilentlyContinue).Source
+if ($exe) {
+    $out = (& $exe version) -join "`n"
     if ($out -match 'version:\s*"?([\d.]+)"?') { $have = $Matches[1] }
-} catch { }
+}
 
 if (-not $have) {
     Warn "找不到 shioaji CLI，請先安裝：pip install `"shioaji[speed]`""
