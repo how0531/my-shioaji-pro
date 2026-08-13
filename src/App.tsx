@@ -21,6 +21,8 @@ import { FlashOrder } from './components/flash-order';
 import { HudHeader } from './components/hud-header';
 import { OptionChain } from './components/option-chain';
 import { PanelLibrary } from './components/panel-library';
+import { PluginBlock } from './components/plugin-block';
+import { PluginStoreDialog } from './components/plugin-store';
 import * as libraryStyles from './components/panel-library.css';
 import {
     broadcastSelectCode,
@@ -72,6 +74,7 @@ import {
 } from './lib/shioaji';
 import { onOrderEvent } from './lib/stream';
 import { ensureAccounts, getAccountState } from './lib/account-store';
+import { getPanelDef, initPlugins, usePluginsState } from './lib/plugins/store';
 import { notify } from './lib/trade';
 import type { ContractInfo } from './lib/types/contract';
 import type { Trade } from './lib/types/order';
@@ -343,6 +346,8 @@ function BlockBody({
             ) : (
                 <BlockPlaceholder />
             );
+        case 'plugin':
+            return <PluginBlock block={block} code={contract?.code ?? null} />;
     }
 }
 
@@ -398,8 +403,15 @@ function BlockView(props: BlockViewProps) {
     const { block, selected, onPinChange, onRemove, ...bodyProps } = props;
     const contract = useBlockContract(block, selected);
     const meta = BLOCK_META[block.type];
-    const showSymbol =
-        meta.pinnable && contract ? ` · ${contract.code}` : '';
+    // 外掛面板：優先用面板自己的 label/pinnable，面板停用或未安裝才落回
+    // BLOCK_META.plugin 的通用備援
+    const pluginDef =
+        block.type === 'plugin' && block.pluginId && block.panelKey
+            ? getPanelDef(block.pluginId, block.panelKey)
+            : null;
+    const label = pluginDef?.label ?? meta.label;
+    const pinnable = pluginDef?.pinnable ?? meta.pinnable;
+    const showSymbol = pinnable && contract ? ` · ${contract.code}` : '';
     const pulseMarket =
         block.type === 'pulse' && block.pulseIndex
             ? ` · ${block.pulseIndex === 'IX0001' ? '上市' : '上櫃'}`
@@ -408,8 +420,8 @@ function BlockView(props: BlockViewProps) {
     return (
         <section className={panel.panel}>
             <PanelChrome
-                title={`${meta.label}${pulseMarket}${showSymbol}`}
-                pinnable={meta.pinnable}
+                title={`${label}${pulseMarket}${showSymbol}`}
+                pinnable={pinnable}
                 pin={block.pin}
                 currentCode={selected?.code ?? null}
                 onPinChange={(pin) => onPinChange(block.id, pin)}
@@ -573,6 +585,9 @@ export default function App() {
         renameCurrentList,
         deleteCurrentList,
     } = useWatchlist();
+    // 訂閱外掛載入狀態：外掛非同步載入完成後，已在版面中的外掛面板標題／
+    // 面板庫的新增清單都要跟著重繪，見 BlockView 與 PanelLibrary 內部用法
+    usePluginsState();
     const [selected, setSelected] = useState<ContractInfo | null>(null);
     const cachedSelected = useContract(selected?.code ?? null);
     const [workspace, setWorkspace] = useState<Workspace>(loadWorkspace);
@@ -755,6 +770,15 @@ export default function App() {
         [],
     );
 
+    // boot: 載入已安裝且啟用的外掛（見 lib/plugins/store.ts）。onSelectCode
+    // 透過 ref 轉發到當下最新的 selectByCode，比照上面 tray-pick-code /
+    // onBroadcastSelectCode 的作法，避免 bridge 綁死 mount 當下的舊 closure
+    useEffect(() => {
+        void initPlugins({
+            onSelectCode: (code) => void selectByCodeRef.current(code),
+        });
+    }, []);
+
     const selectedSnapshot = useMemo(
         () => items.find((i) => i.contract.code === selected?.code)?.snapshot,
         [items, selected],
@@ -784,27 +808,57 @@ export default function App() {
     );
 
     const addBlock = useCallback(
-        (type: BlockType) => {
+        (
+            type: BlockType,
+            plugin?: { pluginId: string; panelKey: string },
+        ) => {
             const meta = BLOCK_META[type];
-            if (
-                meta.singleton &&
-                workspace.blocks.some((b) => b.type === type)
-            ) {
+            // 外掛面板：以面板自己的 singleton/defaultSize 為準，面板剛好
+            // 停用/未安裝（理論上面板庫不會端出這個選項，這裡只是防呆）才
+            // 落回 BLOCK_META.plugin 通用備援
+            const panelDef = plugin
+                ? getPanelDef(plugin.pluginId, plugin.panelKey)
+                : null;
+            const singleton = panelDef?.singleton ?? meta.singleton;
+            const defaultSize = panelDef?.defaultSize ?? meta.defaultSize;
+            const label = panelDef?.label ?? meta.label;
+            const alreadyPresent = plugin
+                ? workspace.blocks.some(
+                      (b) =>
+                          b.type === 'plugin' &&
+                          b.pluginId === plugin.pluginId &&
+                          b.panelKey === plugin.panelKey,
+                  )
+                : workspace.blocks.some((b) => b.type === type);
+            if (singleton && alreadyPresent) {
                 return;
             }
-            trackActivity('開面板', meta.label);
+            trackActivity('開面板', label);
             const id = newBlockId(type);
             const item: LayoutItem = {
                 i: id,
                 x: 0,
                 y: Infinity, // RGL drops it at the bottom
-                w: meta.defaultSize.w,
-                h: meta.defaultSize.h,
-                minW: meta.defaultSize.minW,
-                minH: meta.defaultSize.minH,
+                w: defaultSize.w,
+                h: defaultSize.h,
+                minW: defaultSize.minW,
+                minH: defaultSize.minH,
             };
             updateWorkspace({
-                blocks: [...workspace.blocks, { id, type, pin: null }],
+                blocks: [
+                    ...workspace.blocks,
+                    {
+                        id,
+                        type,
+                        pin: null,
+                        ...(plugin
+                            ? {
+                                  pluginId: plugin.pluginId,
+                                  panelKey: plugin.panelKey,
+                              }
+                            : {}),
+                    },
+                ],
                 layout: [...workspace.layout, item],
             });
         },
@@ -812,6 +866,7 @@ export default function App() {
     );
 
     const [panelLibraryOpen, setPanelLibraryOpen] = useState(false);
+    const [pluginStoreOpen, setPluginStoreOpen] = useState(false);
 
     // jump-to-existing-panel from the panel library: scroll the grid cell
     // into view and pulse its outline once
@@ -1038,6 +1093,7 @@ export default function App() {
             <HudHeader
                 accBalance={balancePoll.data?.acc_balance}
                 onOpenPanelLibrary={() => setPanelLibraryOpen(true)}
+                onOpenPluginStore={() => setPluginStoreOpen(true)}
                 profiles={profiles}
                 currentWorkspace={workspace}
                 onSaveProfile={saveProfileAs}
@@ -1064,6 +1120,10 @@ export default function App() {
                 onAdd={addBlock}
                 onLocate={locateBlock}
                 selectedCode={selected?.code}
+            />
+            <PluginStoreDialog
+                open={pluginStoreOpen}
+                onClose={() => setPluginStoreOpen(false)}
             />
 
             <div className={grid.gridWrap} ref={containerRef}>
