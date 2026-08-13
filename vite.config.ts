@@ -59,6 +59,14 @@ export default defineConfig(({ mode }) => {
                 '@': path.resolve(__dirname, './src'),
             },
         },
+        // preview（launcher 走 pnpm preview）也要代理 /api：web preview 下
+        // getApiBase() 回空字串（非 Tauri），請求會打到 preview 自己的
+        // origin，沒有這條就全部 404，帳務與行情整片空白。
+        preview: {
+            proxy: {
+                '/api': env.VITE_API_TARGET ?? 'http://127.0.0.1:21322',
+            },
+        },
         server: {
             // honor a harness-assigned port (preview tooling sets PORT);
             // default stays 5173 for tauri dev. Bind loopback only so Vite
