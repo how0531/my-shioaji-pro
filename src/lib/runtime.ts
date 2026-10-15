@@ -8,6 +8,14 @@ export const isTauri =
 // far from 8080/8000/3000-style dev defaults and below every OS ephemeral
 // range, so it's essentially never taken by another service.
 export const DEFAULT_PORT = 21322;
+// 隔離 dev App 的整組服務，包含原生管理與 SSE；不可只覆寫 REST URL。
+export function getDevServerPort(): number | undefined {
+    const raw = import.meta.env.DEV ? import.meta.env.VITE_DEV_SERVER_PORT : undefined;
+    if (!raw) return undefined;
+    const port = Number(raw);
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('VITE_DEV_SERVER_PORT 必須是 1024–65535');
+    return port;
+}
 // The shioaji CLI itself still defaults to 8080 — a user-run daemon lives
 // there, so it stays a probe candidate for attach.
 export const LEGACY_PORT = 8080;
@@ -26,6 +34,8 @@ export const EXPECTED_SERVER_VERSION: string =
 const PORT_KEY = 'sj-pro-api-port';
 
 export function getApiPort(): number {
+    const fixed = getDevServerPort();
+    if (fixed) return fixed;
     try {
         const p = Number(localStorage.getItem(PORT_KEY));
         if (Number.isInteger(p) && p > 0 && p < 65536) return p;
@@ -43,6 +53,7 @@ export function setApiPort(port: number): boolean {
     } catch {
         // storage unavailable
     }
+    if (changed && typeof window !== 'undefined') window.dispatchEvent(new Event('sj-pro-api-base-changed'));
     return changed;
 }
 
@@ -69,6 +80,7 @@ export function setApiScheme(scheme: ApiScheme): boolean {
     } catch {
         // storage unavailable
     }
+    if (changed && typeof window !== 'undefined') window.dispatchEvent(new Event('sj-pro-api-base-changed'));
     return changed;
 }
 
@@ -100,6 +112,7 @@ export function setSpawnPort(port: number | null) {
 }
 
 export function getServerPid(): number | null {
+    if (getDevServerPort() && getSpawnPort() !== getDevServerPort()) return null;
     try {
         const p = Number(localStorage.getItem(PID_KEY));
         if (Number.isInteger(p) && p > 0) return p;
@@ -124,6 +137,9 @@ export function setServerPid(pid: number | null) {
 // localhost and ::1.
 export function getApiBase(): string {
     const env = import.meta.env.VITE_API_BASE as string | undefined;
+    if (getDevServerPort() && env && env !== `${getApiScheme()}://127.0.0.1:${getDevServerPort()}`) {
+        throw new Error('隔離 dev 服務與 VITE_API_BASE 不一致，拒絕連線');
+    }
     if (env) return env;
     return isTauri ? `${getApiScheme()}://127.0.0.1:${getApiPort()}` : '';
 }
@@ -134,6 +150,11 @@ export function getApiBase(): string {
 // streams needed a sibling-loopback-origin workaround in dev.)
 export function getStreamBase(): string {
     const env = import.meta.env.VITE_STREAM_BASE as string | undefined;
+    if (getDevServerPort() && env) {
+        const direct = `${getApiScheme()}://127.0.0.1:${getDevServerPort()}`;
+        const sameOrigin = typeof location !== 'undefined' ? location.origin : undefined;
+        if (env !== direct && env !== sameOrigin) throw new Error('隔離 dev 服務與 SSE 目的地不一致，拒絕連線');
+    }
     if (env) return env;
     return getApiBase();
 }

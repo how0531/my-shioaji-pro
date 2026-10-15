@@ -47,6 +47,56 @@ export const sessionChip = style({
     alignSelf: 'center',
 });
 
+// 期/選的時段標籤可點 — 手動鎖定時用強調色，一眼看出不是自動
+export const sessionChipBtn = styleVariants({
+    auto: [
+        sessionChip,
+        {
+            border: 'none',
+            cursor: 'pointer',
+            ':hover': { color: vars.color.foreground },
+        },
+    ],
+    manual: [
+        sessionChip,
+        {
+            border: 'none',
+            cursor: 'pointer',
+            color: vars.color.accent,
+            background: vars.color.accentDim,
+        },
+    ],
+});
+
+// 時段選單 — 標籤在 legend 左側，選單往右展開
+export const sessionPop = style({
+    position: 'absolute',
+    top: 'calc(100% + 4px)',
+    left: 0,
+    zIndex: 30,
+    display: 'flex',
+    padding: '6px 8px',
+    background: vars.color.panelRaised,
+    border: `1px solid ${vars.color.border}`,
+    borderRadius: vars.radius.md,
+    boxShadow: '0 6px 20px rgba(0, 0, 0, 0.35)',
+    whiteSpace: 'nowrap',
+});
+
+// 試搓揭示讀值 — 琥珀色與正式成交明確區隔（開盤即消失）
+export const simChip = style({
+    fontFamily: vars.font.mono,
+    fontSize: '0.62rem',
+    fontWeight: 600,
+    padding: '1px 6px',
+    borderRadius: vars.radius.sm,
+    color: vars.color.amber,
+    border: '1px solid rgba(224, 164, 60, 0.45)',
+    background: 'rgba(224, 164, 60, 0.08)',
+    alignSelf: 'center',
+    whiteSpace: 'nowrap',
+});
+
 // hover 讀值浮在圖表左下角（時間軸上方）— 不佔 legend 空間，
 // 出現/消失也不影響任何版面
 export const hoverFloat = style({
@@ -173,6 +223,12 @@ export const settingsRow = style({
 
 export const settingsLabel = style({
     minWidth: '2.2em',
+});
+
+// 設定列的說明（例如回顧時段停板模式暫以自動縮放）
+export const settingsHint = style({
+    color: vars.color.amber,
+    fontSize: '0.6rem',
 });
 
 // 自訂 range 滑桿：4px 軌道以 --sj-fill 漸層填到滑塊位置，

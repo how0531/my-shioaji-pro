@@ -1,7 +1,8 @@
 // src/components/quote-board.tsx — selected symbol mega display
 
-import { useQuote } from '../hooks/use-stream';
+import { useDisplayBook } from '../hooks/use-display-book';
 import type { ContractInfo } from '../lib/types/contract';
+import { limitStateOf } from '../lib/limit-state';
 import type { Snapshot } from '../lib/types/market';
 import { fmtInt, fmtPct, fmtPrice, fmtSigned } from '../lib/utils/format';
 import * as panel from './panel.css';
@@ -9,12 +10,12 @@ import * as styles from './quote-board.css';
 
 export function QuoteBoard({
     contract,
-    snapshot,
+    snapshot: suppliedSnapshot,
 }: {
     contract: ContractInfo;
     snapshot?: Snapshot;
 }) {
-    const quote = useQuote(contract.code);
+    const { quote, snapshot, book } = useDisplayBook(contract.code, suppliedSnapshot, contract);
     const tick = quote?.tick;
     const index = quote?.index;
     const isIndex = contract.security_type === 'IND';
@@ -56,20 +57,13 @@ export function QuoteBoard({
         index?.vol_sum ??
         index?.volume ??
         snapshot?.total_volume;
-    const bidask = quote?.bidask;
-    const bid1 = bidask ? Number(bidask.bid_price[0]) : undefined;
-    const ask1 = bidask ? Number(bidask.ask_price[0]) : undefined;
+    const bid1 = book?.bids[0];
+    const ask1 = book?.asks[0];
 
     const dir =
         chg === undefined || chg === 0 ? 'flat' : chg > 0 ? 'up' : 'down';
-    const atLimit =
-        !isIndex && close !== undefined && contract.limit_up > 0
-            ? close >= contract.limit_up
-                ? 'up'
-                : contract.limit_down > 0 && close <= contract.limit_down
-                  ? 'down'
-                  : null
-            : null;
+    // 共用判斷（指數、興櫃不亮；跳動價位精度比較）
+    const atLimit = limitStateOf(contract, close);
 
     return (
         <div className={`${styles.board} drag-handle`}>
@@ -164,21 +158,21 @@ export function QuoteBoard({
                         <span className={styles.statValue}>
                             {tick?.time?.slice(0, 8) ?? '—'}
                         </span>
-                        <span className={styles.statLabel}>委買</span>
+                        <span className={styles.statLabel} title={book?.time}>委買{book?.source === 'snapshot' && '（快照）'}</span>
                         <span className={styles.statLabel}>買量</span>
                         <span className={styles.statLabel}>委賣</span>
                         <span className={styles.statLabel}>賣量</span>
                         <span className={`${styles.statValue} ${panel.dirText.up}`}>
-                            {fmtPrice(bid1)}
+                            {fmtPrice(bid1?.price)}
                         </span>
                         <span className={styles.statValue}>
-                            {bidask ? fmtInt(bidask.bid_volume[0] ?? 0) : '—'}
+                            {fmtInt(bid1?.vol)}
                         </span>
                         <span className={`${styles.statValue} ${panel.dirText.down}`}>
-                            {fmtPrice(ask1)}
+                            {fmtPrice(ask1?.price)}
                         </span>
                         <span className={styles.statValue}>
-                            {bidask ? fmtInt(bidask.ask_volume[0] ?? 0) : '—'}
+                            {fmtInt(ask1?.vol)}
                         </span>
                     </>
                 )}

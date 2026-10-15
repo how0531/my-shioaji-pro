@@ -1,8 +1,10 @@
+import { canTrade } from '../lib/account-tradable';
 // src/components/settings-dialog.tsx — 統一設定面板：外觀／音效與隱私／
 // 帳號／風控／版面 五分類。原本散在 header 的主題/帳號/版面 popover 全數
 // 收斂到這裡；風控「規則」也在此（Kill Switch 留在 header，一鍵可達）。
 
 import {
+    Bot,
     LayoutGrid,
     Palette,
     RefreshCw,
@@ -12,12 +14,20 @@ import {
     X,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
+import { AsyncStatus } from './async-status';
 import {
     ensureAccounts,
     refreshAccounts,
     selectAccount,
     useAccounts,
 } from '../lib/account-store';
+import {
+    API_MANAGEMENT_URL,
+    SIGNING_URLS,
+    unsignedAccountLabel,
+    unsignedAccountTitle,
+} from '../lib/account-signing';
+import { useServerInfo } from '../lib/server-info-store';
 import {
     HEADER_ITEMS,
     setHeaderItem,
@@ -37,10 +47,12 @@ import {
     setRiskSettings,
     useRiskSettings,
 } from '../lib/risk';
+import { isTauri } from '../lib/runtime';
 import { setSoundEnabled, soundEnabled } from '../lib/sounds';
 import {
     setThemeSettings,
     useThemeSettings,
+    baseMode,
     type Convention,
     type FontScale,
     type ThemeMode,
@@ -50,6 +62,23 @@ import {
     useToastScale,
     type ToastScale,
 } from '../lib/toast-prefs';
+import {
+    setLimitStyle,
+    useLimitStyle,
+    type LimitStyle,
+} from '../lib/limit-style-prefs';
+import {
+    setChartHoverPricePick,
+    useChartHoverPricePick,
+} from '../lib/chart-price-prefs';
+import {
+    isAgentHarnessEnabled,
+    setAgentHarnessEnabled,
+} from '../lib/tauri';
+import { CUSTOM_BASES } from '../lib/custom-theme';
+import { CustomThemeEditor } from './custom-theme-editor';
+import { BackgroundExecutionSetting } from './background-execution-setting';
+import { ExternalLink } from './external-link';
 import { Orb } from './orb';
 import * as hud from './hud-header.css';
 import * as panel from './panel.css';
@@ -57,8 +86,8 @@ import * as styles from './settings-dialog.css';
 
 const MODE_OPTIONS: { key: ThemeMode; label: string }[] = [
     { key: 'dark', label: '深色' },
-    { key: 'midnight', label: '純黑' },
     { key: 'light', label: '淺色' },
+    { key: 'custom', label: '自訂' },
 ];
 
 const CONVENTION_OPTIONS: { key: Convention; label: string }[] = [
@@ -66,18 +95,33 @@ const CONVENTION_OPTIONS: { key: Convention; label: string }[] = [
     { key: 'intl', label: '綠漲紅跌' },
 ];
 
-type SettingsTab = 'appearance' | 'soundPrivacy' | 'accounts' | 'risk' | 'layout';
+const LIMIT_STYLE_OPTIONS: { key: LimitStyle; label: string; title: string }[] = [
+    { key: 'block', label: '數字區色塊', title: '價格與漲跌兩行包成實心色塊、白字' },
+    { key: 'tint', label: '淡底＋色條', title: '整列淡淡的漲跌色底，右緣一條實色色條' },
+    { key: 'solid', label: '整列實心', title: '整列實心漲跌色、白字' },
+    { key: 'none', label: '不標示', title: '到漲跌停不加任何標示' },
+];
+
+type SettingsTab =
+    | 'appearance'
+    | 'soundPrivacy'
+    | 'accounts'
+    | 'risk'
+    | 'agent'
+    | 'layout';
 
 const TABS: { key: SettingsTab; label: string; icon: React.ReactNode }[] = [
     { key: 'appearance', label: '外觀', icon: <Palette size={13} /> },
     { key: 'soundPrivacy', label: '音效與隱私', icon: <Volume2 size={13} /> },
     { key: 'accounts', label: '帳號', icon: <UserRound size={13} /> },
     { key: 'risk', label: '風控', icon: <ShieldAlert size={13} /> },
+    { key: 'agent', label: 'Agent', icon: <Bot size={13} /> },
     { key: 'layout', label: '版面', icon: <LayoutGrid size={13} /> },
 ];
 
 function AppearanceSection() {
     const settings = useThemeSettings();
+    const limitStyle = useLimitStyle();
     const toastScale = useToastScale();
     const headerItems = useHeaderItems();
     return (
@@ -88,12 +132,19 @@ function AppearanceSection() {
                     <button
                         key={m.key}
                         className={hud.opt[settings.mode === m.key ? 'on' : 'off']}
-                        onClick={() => setThemeSettings({ mode: m.key })}
+                        onClick={() =>
+                            setThemeSettings(
+                                m.key === 'custom'
+                                    ? { mode: 'custom', custom: settings.custom ?? CUSTOM_BASES[baseMode(settings)] }
+                                    : { mode: m.key },
+                            )
+                        }
                     >
                         {m.label}
                     </button>
                 ))}
             </div>
+            {settings.mode === 'custom' && <CustomThemeEditor />}
             <span className={hud.settingLabel}>漲跌顏色 Price Colors</span>
             <div className={hud.settingGroup}>
                 {CONVENTION_OPTIONS.map((c) => (
@@ -112,14 +163,33 @@ function AppearanceSection() {
                 <span className={panel.dirText.up}>▲ +1.25 上漲</span>
                 <span className={panel.dirText.down}>▼ -1.25 下跌</span>
             </div>
+            <span className={hud.settingLabel} id='limit-style-label'>
+                自選清單漲跌停 Limit Highlight
+            </span>
+            <div
+                className={hud.settingGroup}
+                role='group'
+                aria-labelledby='limit-style-label'
+            >
+                {LIMIT_STYLE_OPTIONS.map((o) => (
+                    <button
+                        key={o.key}
+                        className={hud.opt[limitStyle === o.key ? 'on' : 'off']}
+                        title={o.title}
+                        aria-pressed={limitStyle === o.key}
+                        onClick={() => setLimitStyle(o.key)}
+                    >
+                        {o.label}
+                    </button>
+                ))}
+            </div>
             <span className={hud.settingLabel}>字級 Font Size</span>
             <div className={hud.settingGroup}>
                 {(
                     [
-                        [0.85, '小'],
-                        [1, '標準'],
-                        [1.15, '大'],
-                        [1.3, '特大'],
+                        [1, '小'],
+                        [1.15, '標準'],
+                        [1.3, '大'],
                     ] as [FontScale, string][]
                 ).map(([scale, label]) => (
                     <button
@@ -232,11 +302,15 @@ function SoundPrivacySection() {
     );
 }
 
-function AccountsSection() {
-    const { accounts, selectedStock, selectedFutures, loaded } = useAccounts();
+export function AccountsSection() {
+    const { accounts, selectedStock, selectedFutures, loaded, loadError } = useAccounts();
+    const simulation = useServerInfo()?.simulation === true;
     const priv = usePrivacyMode();
     const [refreshing, setRefreshing] = useState(false);
     useEffect(ensureAccounts, []);
+    const unsignedTypes = (['S', 'F'] as const).filter((t) =>
+        accounts.some((a) => a.account_type === t && !a.signed),
+    );
     const groups: { label: string; type: 'S' | 'F'; selected: string }[] = [
         {
             label: '證券帳戶',
@@ -272,13 +346,13 @@ function AccountsSection() {
                                         hud.opt[
                                             g.selected === key ? 'on' : 'off'
                                         ]
-                                    } ${a.signed ? '' : styles.acctUnsigned}`}
+                                    } ${canTrade(a) ? '' : styles.acctUnsigned}`}
                                     style={{ width: '100%', marginTop: 4 }}
-                                    disabled={!a.signed}
+                                    disabled={!canTrade(a)}
                                     title={
                                         a.signed
                                             ? undefined
-                                            : '未簽署 API 約定書（無法下單）'
+                                            : unsignedAccountTitle(simulation)
                                     }
                                     onClick={() => selectAccount(a)}
                                 >
@@ -287,7 +361,7 @@ function AccountsSection() {
                                     {maskName(a.username, priv)}）
                                     {!a.signed && (
                                         <span className={styles.unsignedTag}>
-                                            未簽署（無法下單）
+                                            {unsignedAccountLabel(simulation)}
                                         </span>
                                     )}
                                 </button>
@@ -298,15 +372,42 @@ function AccountsSection() {
             })}
             {loaded && accounts.length === 0 && (
                 <span className={hud.emptyHint}>
-                    尚未取得帳號 — 伺服器就緒後按下方「重新整理帳號」。
+                    <AsyncStatus phase={loadError ? 'error' : 'idle'}
+                        text={loadError
+                            ? '帳號讀取失敗 — 請確認伺服器連線後按下方「重新整理帳號」。'
+                            : '尚未取得帳號 — 伺服器就緒後按下方「重新整理帳號」。'} />
                 </span>
             )}
             {!loaded && (
-                <span className={hud.emptyHint}>載入帳號中…</span>
+                <span className={hud.emptyHint}><AsyncStatus phase='loading' text='載入帳號中…' /></span>
             )}
             <span className={hud.emptyHint}>
-                下單與帳務查詢都使用選定的帳號；未簽署 API
-                約定書的帳戶會列出但無法選為下單帳戶。
+                下單與帳務查詢都使用選定的帳號；
+                {simulation
+                    ? unsignedAccountLabel(true)
+                    : '尚未完成 API 約定書簽署或模擬測試的帳戶會列出但無法選為下單帳戶。'}
+                {unsignedTypes.length > 0 && (
+                    <>
+                        請到永豐 API 管理頁查看原因並完成：
+                        <span className={styles.signLinks}>
+                            <ExternalLink
+                                href={API_MANAGEMENT_URL}
+                                className={styles.signLink}
+                            >
+                                API 管理頁
+                            </ExternalLink>
+                            {unsignedTypes.map((t) => (
+                                <ExternalLink
+                                    key={t}
+                                    href={SIGNING_URLS[t].url}
+                                    className={styles.signLink}
+                                >
+                                    {SIGNING_URLS[t].label}
+                                </ExternalLink>
+                            ))}
+                        </span>
+                    </>
+                )}
             </span>
             <button
                 className={hud.updateBtn}
@@ -331,6 +432,7 @@ function AccountsSection() {
 
 function RiskSection() {
     const risk = useRiskSettings();
+    const hoverPricePick = useChartHoverPricePick();
     const dailyPnl = getDailyPnl();
     // 金額遮蔽也要蓋住這裡的損益估算 — 隱私開關不該在設定 dialog 裡漏底
     const privMoney = usePrivacyMoney();
@@ -385,6 +487,160 @@ function RiskSection() {
                 <br />
                 Kill Switch（鎖定下單）在畫面右上角「風控」鈕，一鍵鎖定/解鎖。
             </span>
+            <span className={hud.settingLabel}>下單確認</span>
+            <div className={hud.switchRow}>
+                <span
+                    className={hud.switchLabel}
+                    title='手動下單前顯示可視化委託確認（方向/商品/價格/數量）；停損停利等自動觸發單不受影響'
+                >
+                    手動下單確認
+                </span>
+                <button
+                    className={
+                        hud.switchTrack[
+                            risk.confirmManualOrders ? 'on' : 'off'
+                        ]
+                    }
+                    title={
+                        risk.confirmManualOrders
+                            ? '關閉手動下單確認'
+                            : '啟用手動下單確認'
+                    }
+                    onClick={() =>
+                        setRiskSettings({
+                            confirmManualOrders: !risk.confirmManualOrders,
+                        })
+                    }
+                />
+            </div>
+            <span className={hud.emptyHint}>
+                預設關閉（維持快速下單）。開啟後閃電下單、下單面板、
+                圖表點價、平倉與鋪單都會先跳委託確認；停損/停利等
+                自動觸發單與 Agent 下單不經過此確認。
+            </span>
+            {isTauri && <BackgroundExecutionSetting />}
+            <span className={hud.settingLabel}>圖表帶價 Chart Price</span>
+            <div className={hud.switchRow}>
+                <span
+                    className={hud.switchLabel}
+                    title='在 K 線圖上移動游標時，把十字線價位即時帶入同商品的下單面板'
+                >
+                    游標移動帶價
+                </span>
+                <button
+                    className={hud.switchTrack[hoverPricePick ? 'on' : 'off']}
+                    aria-label='游標移動帶價'
+                    aria-pressed={hoverPricePick}
+                    title={
+                        hoverPricePick
+                            ? '關閉游標移動帶價（只在點擊圖表時帶價）'
+                            : '啟用游標移動帶價'
+                    }
+                    onClick={() => setChartHoverPricePick(!hoverPricePick)}
+                />
+            </div>
+            <span className={hud.emptyHint}>
+                {'預設關閉，避免游標掃過圖表時改寫已填好的委託價；關閉時仍可點擊 K 線圖或五檔帶價。'}
+            </span>
+            <span className={hud.settingLabel}>快捷鍵 Hotkeys</span>
+            <div className={hud.switchRow}>
+                <span
+                    className={hud.switchLabel}
+                    title='0.6 秒內連按兩次 Esc 撤銷所有未成交委託'
+                >
+                    雙擊 Esc 全部刪單
+                </span>
+                <button
+                    className={
+                        hud.switchTrack[risk.escCancelAll ? 'on' : 'off']
+                    }
+                    title={
+                        risk.escCancelAll
+                            ? '關閉雙擊 Esc 全部刪單'
+                            : '啟用雙擊 Esc 全部刪單'
+                    }
+                    onClick={() =>
+                        setRiskSettings({ escCancelAll: !risk.escCancelAll })
+                    }
+                />
+            </div>
+            <span className={hud.emptyHint}>
+                預設關閉，避免誤觸；開啟後在非輸入狀態下 0.6 秒內連按兩次
+                Esc 會撤銷全部未成交委託（第一下會先跳提示）。
+            </span>
+        </>
+    );
+}
+
+function AgentSection() {
+    const [enabled, setEnabled] = useState(isAgentHarnessEnabled());
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState('');
+
+    const [note, setNote] = useState('');
+    const toggle = async () => {
+        const next = !enabled;
+        setBusy(true);
+        setError('');
+        setNote('');
+        try {
+            const res = await setAgentHarnessEnabled(next);
+            setEnabled(next);
+            if (res.restarted) {
+                // 撿到孤兒 sidecar（上次 app 異常退出）— 已透過 native
+                // spawn 重啟以取得 harness 所有權
+                setNote('伺服器已自動重啟以建立 Agent Harness 所有權');
+            }
+        } catch (cause) {
+            setError(cause instanceof Error ? cause.message : String(cause));
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    return (
+        <>
+            <span className={hud.settingLabel}>Agent Harness</span>
+            <div className={hud.switchRow}>
+                <span className={hud.switchLabel}>保護 Agent 下單操作</span>
+                <button
+                    className={hud.switchTrack[enabled ? 'on' : 'off']}
+                    disabled={busy}
+                    title={enabled ? '關閉 Agent Harness' : '開啟 Agent Harness'}
+                    onClick={() => void toggle()}
+                />
+            </div>
+            <span className={hud.emptyHint}>
+                關閉時，一般 UI 下單走原本的直接 HTTP 路徑；開啟後，Agent
+                與 UI 的每筆交易異動都需要一次性授權。切換立即生效，
+                不需重啟伺服器。
+            </span>
+            <div className={hud.switchRow}>
+                <span
+                    className={hud.switchLabel}
+                    title='Agent 在正式環境的每筆交易都需由獨立核可視窗確認'
+                >
+                    正式環境逐筆核可
+                </span>
+                <button
+                    className={hud.switchTrack.on}
+                    disabled
+                    title='Phase 1 安全基線：正式環境固定開啟'
+                />
+            </div>
+            <span className={hud.emptyHint}>
+                正式環境的逐筆確認固定由獨立的原生核可視窗確認，無法關閉；
+                正式 Auto 首筆需在原生視窗授權本次 runtime 與帳戶，停止或
+                切換後失效。每次 App 重啟都會恢復為「逐筆確認」。此安全邊界與
+                「手動下單確認」（設定 → 風控）互相獨立。
+            </span>
+            {busy && (
+                <span className={hud.emptyHint}>
+                    切換中…（若需重啟伺服器約 10–60 秒）
+                </span>
+            )}
+            {note && <span className={hud.emptyHint}>{note}</span>}
+            {error && <span className={styles.errorText}>{error}</span>}
         </>
     );
 }
@@ -442,10 +698,15 @@ export function SettingsDialog({
     useEffect(() => {
         if (!open) return;
         const onKey = (e: KeyboardEvent) => {
-            if (e.key === 'Escape') onClose();
+            if (e.key === 'Escape') {
+                // capture + preventDefault so the global Esc-Esc cancel-all
+                // hotkey ignores the press that closes this dialog
+                e.preventDefault();
+                onClose();
+            }
         };
-        window.addEventListener('keydown', onKey);
-        return () => window.removeEventListener('keydown', onKey);
+        window.addEventListener('keydown', onKey, true);
+        return () => window.removeEventListener('keydown', onKey, true);
     }, [open, onClose]);
 
     if (!open) return null;
@@ -484,6 +745,7 @@ export function SettingsDialog({
                         {tab === 'soundPrivacy' && <SoundPrivacySection />}
                         {tab === 'accounts' && <AccountsSection />}
                         {tab === 'risk' && <RiskSection />}
+                        {tab === 'agent' && <AgentSection />}
                         {tab === 'layout' && (
                             <LayoutSection {...layoutProps} onClose={onClose} />
                         )}

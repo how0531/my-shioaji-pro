@@ -1,10 +1,46 @@
 // src/lib/workspace.ts — dynamic panel blocks + grid layout + named profiles
 
 import type { LayoutItem } from 'react-grid-layout';
+import { isLinkGroup, LINK_GROUPS, type LinkGroupId } from './flash-link';
 
-// single source of truth for the main grid column count — the workspace
-// grid (App.tsx) and layout thumbnails (lib/layout-thumb.ts) must agree
-export const GRID_COLS = 24;
+// 版面座標底座（儲存基準）：288 欄 = 傳統 24 欄 × 12。
+// - 撰寫/舊存檔仍是 24 欄語意，載入時 ×12 無損升階
+// - App 渲染時依視窗寬選密度 k∈{1,2,3,4}（cols = 24k，每欄 ~40–55px，
+//   超寬螢幕的欄寬不再等比放大、拖拉步進更細）
+// - 12 可被 1/2/3/4/6 整除 → 任一密度的回存 ×(12/k) 都是整數（無損）；
+//   只有「跨密度」（換螢幕/跨機）才會有一次 ≤ 半欄的舍入
+// layout-thumb 以 GRID_COLS 做等比縮放，與儲存基準一致即可。
+export const GRID_COLS = 288;
+export const GRID_LEGACY_COLS = 24;
+export const GRID_LEGACY_SCALE = GRID_COLS / GRID_LEGACY_COLS; // 12
+
+function upscaleLayout(layout: LayoutItem[]): LayoutItem[] {
+    return layout.map((l) => ({
+        ...l,
+        x: l.x * GRID_LEGACY_SCALE,
+        w: l.w * GRID_LEGACY_SCALE,
+        ...(l.minW !== undefined ? { minW: l.minW * GRID_LEGACY_SCALE } : {}),
+        ...(l.maxW !== undefined ? { maxW: l.maxW * GRID_LEGACY_SCALE } : {}),
+    }));
+}
+
+export function upscaleLegacyWorkspace(w: Workspace): Workspace {
+    return { ...w, layout: upscaleLayout(w.layout) };
+}
+
+// 288 欄儲存值 → 密度 k 的渲染座標。邊緣錨定舍入：x 與右緣各走同一個
+// 單調映射、w 取差值 — 相鄰面板共用的邊緣舍入後仍共用，絕不重疊。
+// （x/w 獨立舍入時，跨密度開啟可能產生 1 欄重疊 → RGL compaction 會把
+// 面板往下推一列並被 mount 觸發的 onLayoutChange 回存。）
+export function toRenderGeom(
+    l: { x: number; w: number },
+    density: number,
+): { x: number; w: number } {
+    const f = density / GRID_LEGACY_SCALE;
+    const x = Math.round(l.x * f);
+    const right = Math.round((l.x + l.w) * f);
+    return { x, w: Math.max(1, right - x) };
+}
 
 export type BlockType =
     | 'watchlist'
@@ -17,6 +53,7 @@ export type BlockType =
     | 'ticket'
     | 'tape'
     | 'flash'
+    | 'oddspread'
     | 'pnl'
     | 'chips'
     | 'volprofile'
@@ -26,9 +63,11 @@ export type BlockType =
     | 'replay'
     | 'depthmap'
     | 'combo'
+    | 'combolist'
     | 'notices'
     | 'debug'
     | 'grid'
+    | 'conditional'
     | 'heatmap'
     | 'pulse'
     | 'signals'
@@ -36,15 +75,33 @@ export type BlockType =
     | 'backtest'
     | 'assistant';
 
-export type PulseSection = 'stocks' | 'industries' | 'flow';
+// 'industries' 區塊已移出市場脈動（產業地圖歸產業全景面板）— 舊存檔的
+// 'industries' 值由面板端讀時過濾、權重按比例併入其餘區塊
+export type PulseSection = 'stocks' | 'flow';
 export type PulseSectionWeights = Record<PulseSection, number>;
 export type PulseIndexCode = 'IX0001' | 'IX0043';
 
 export interface Block {
     id: string;
+    // Panel-local indicator state travels with saved workspace profiles.
+    indicatorState?: import('./indicator-instance-service').IndicatorPanelState;
     type: BlockType;
     // null → follows the globally selected symbol; string → pinned to a code
     pin: string | null;
+    // 閃電下單面板自己的帳戶（每市場一組 key）— 沒有 key 的市場跟隨主畫面
+    flashAccounts?: import('./flash-account').FlashAccountKeys;
+    // 閃電下單面板自己的單位（整股／盤中零股），換股票不變；缺省 = 設為預設的單位
+    flashLot?: import('./flash-account').FlashLot;
+    // 閃電下單「記住數量」：張／股／口各一個數量；false = 使用者關閉，缺省 = 預設開啟
+    flashQty?: import('./flash-qty-memory').FlashQtySetting;
+    // 閃電下單面板自己的信用條件（整股：現股／融資／融券／借券／借券豁免＋現股當沖先賣），換股票不變；缺省 = 現股
+    flashCredit?: import('./flash-account').FlashCredit;
+    // 閃電下單面板自己的委託條件（效期／期貨倉別／範圍市價），換商品不變；缺省 = ROD、自動、市價
+    flashOrder?: import('./flash-account').FlashOrderOpts;
+    // 連動群組 A／B／C（pin 為 null 時才有效）：群組成員共用 Workspace.linkGroups 的代碼
+    linkGroup?: import('./flash-link').LinkGroupId;
+    // 閃電下單的對應商品（照選取／現股／個股期＋規格月份＋價差對照）；缺省 = 照選取
+    flashLink?: import('./flash-link').FlashLink;
     // Market-pulse presets can open multiple panels on distinct views.
     pulseVisualization?: 'distribution' | 'flow';
     pulseSections?: PulseSection[];
@@ -54,11 +111,110 @@ export interface Block {
     wallList?: string;
     wallCols?: number;
     wallRows?: number;
+    // 時段選擇（issue #73）— K 線全盤/僅日盤、當日走勢自動/日盤/夜盤，
+    // 跟版面一起持久化；缺省 = 全盤 / 自動
+    chartSession?: 'all' | 'day';
+    intradaySession?: 'auto' | 'day' | 'night';
+    // K 線圖下單設定（#204，每市場一組）— 跟版面一起持久化
+    chartOrder?: import('./chart-order-settings').ChartOrderPanelState;
+    // K 棒讀值列（開高低收，#240）— false = 隱藏；缺省 = 顯示
+    chartOhlc?: boolean;
+    // 可見範圍最高／最低標記（#240）— false = 隱藏；缺省 = 顯示
+    chartHighLow?: boolean;
 }
 
 export interface Workspace {
     blocks: Block[];
     layout: LayoutItem[];
+    // 連動群組各自的代碼（跟版面一起存）
+    linkGroups?: Partial<Record<LinkGroupId, string>>;
+}
+
+// ---- 連動群組 ----
+export type LinkMode = 'main' | 'pin' | LinkGroupId;
+
+// 連動群組這版只給閃電下單（其他面板的送單閘門不含群組身分）
+export function blockLinkMode(block: Block): LinkMode {
+    if (block.pin) return 'pin';
+    return block.type === 'flash' && isLinkGroup(block.linkGroup) ? block.linkGroup : 'main';
+}
+
+/** 面板的來源代碼：鎖定代碼、群組代碼；null = 跟自選選取 */
+export function blockSourceCode(block: Block, w: Workspace): string | null {
+    const mode = blockLinkMode(block);
+    if (mode === 'pin') return block.pin;
+    if (mode === 'main') return null;
+    return w.linkGroups?.[mode] ?? null;
+}
+
+/** 切換連動方式。加入沒人用的群組時以面板目前的代碼當群組代碼 */
+export function withLinkMode(w: Workspace, id: string, mode: LinkMode, currentCode: string | null): Workspace {
+    if (mode === 'pin' && !currentCode) return w;
+    if (isLinkGroup(mode) && w.blocks.find((b) => b.id === id)?.type !== 'flash') return w;
+    const linkGroups = { ...w.linkGroups };
+    const unused = isLinkGroup(mode) && !w.blocks.some((b) => b.id !== id && blockLinkMode(b) === mode);
+    if (isLinkGroup(mode) && currentCode && (!linkGroups[mode] || unused)) linkGroups[mode] = currentCode;
+    return {
+        ...w,
+        linkGroups,
+        blocks: w.blocks.map((b) => {
+            if (b.id !== id) return b;
+            const { linkGroup: _g, ...rest } = b;
+            return isLinkGroup(mode) ? { ...rest, pin: null, linkGroup: mode } : { ...rest, pin: mode === 'pin' ? currentCode : null };
+        }),
+    };
+}
+
+/** 群組換代碼：所有成員同一次一起換 */
+export function withGroupCode(w: Workspace, group: LinkGroupId, code: string): Workspace {
+    return { ...w, linkGroups: { ...w.linkGroups, [group]: code } };
+}
+
+export function linkGroupSummary(w: Workspace): { id: LinkGroupId; code: string | null; count: number }[] {
+    return LINK_GROUPS.map((id) => ({
+        id,
+        code: w.linkGroups?.[id] ?? null,
+        count: w.blocks.filter((b) => blockLinkMode(b) === id).length,
+    }));
+}
+
+export type SessionConfigPatch = Partial<
+    Pick<Block, 'chartSession' | 'intradaySession' | 'chartOrder' | 'chartOhlc' | 'chartHighLow'>
+>;
+
+// 開彈出視窗時把面板的時段選擇帶進 URL（session=…）
+export function popoutSessionParam(block: Block): Record<string, string> {
+    const session =
+        block.type === 'chart'
+            ? block.chartSession
+            : block.type === 'intraday'
+              ? block.intradaySession
+              : undefined;
+    return session ? { session } : {};
+}
+
+// 彈出視窗讀回 URL 的 session — 依面板類型只接受已知值
+export function popoutSessionFromQuery(q: URLSearchParams): SessionConfigPatch {
+    const v = q.get('session');
+    return {
+        chartSession: v === 'all' || v === 'day' ? v : undefined,
+        intradaySession:
+            v === 'auto' || v === 'day' || v === 'night' ? v : undefined,
+    };
+}
+
+// 面板時段選擇寫回 workspace（跟版面/版面庫一起存）
+export function withBlockSessionConfig(
+    w: Workspace,
+    id: string,
+    patch: SessionConfigPatch,
+): Workspace {
+    return {
+        ...w,
+        blocks: w.blocks.map((block) =>
+            block.id === id ? { ...block, ...patch } : block,
+        ),
+    };
 }
 
 export interface Profile {
@@ -175,6 +331,14 @@ export const BLOCK_META: Record<
         singleton: false,
         defaultSize: { w: 5, h: 14, minW: 4, minH: 8 },
     },
+    oddspread: {
+        label: '整零價差',
+        description: '整股與盤中零股價差試算、兩市場五檔對照與兩腳送單',
+        category: 'trading',
+        pinnable: true,
+        singleton: false,
+        defaultSize: { w: 6, h: 16, minW: 5, minH: 10 },
+    },
     pnl: {
         label: '損益分析',
         description: '已實現與未實現損益',
@@ -211,7 +375,8 @@ export const BLOCK_META: Record<
         label: '個股期選擇器',
         description: '個股期貨標的瀏覽',
         category: 'derivatives',
-        pinnable: false,
+        // 標準 chrome 連動/釘選：不釘＝跟隨自選選擇切標的，釘＝固定
+        pinnable: true,
         singleton: true,
         defaultSize: { w: 9, h: 12, minW: 7, minH: 8 },
     },
@@ -247,6 +412,15 @@ export const BLOCK_META: Record<
         singleton: true,
         defaultSize: { w: 6, h: 14, minW: 5, minH: 10 },
     },
+    combolist: {
+        label: '組合商品',
+        description: '交易所組合商品列表與報價，點列帶入組合單',
+        category: 'derivatives',
+        // 標準 chrome 連動/釘選：不釘＝跟隨自選選擇切家族，釘＝固定
+        pinnable: true,
+        singleton: true,
+        defaultSize: { w: 6, h: 12, minW: 4, minH: 8 },
+    },
     notices: {
         label: '通知中心',
         description: '警示與系統通知',
@@ -257,7 +431,7 @@ export const BLOCK_META: Record<
     },
     debug: {
         label: '診斷 Debug',
-        description: '連線與訂閱狀態診斷',
+        description: 'API 用量、查詢壓力、異常與連線診斷',
         category: 'tools',
         pinnable: false,
         singleton: true,
@@ -271,9 +445,17 @@ export const BLOCK_META: Record<
         singleton: false,
         defaultSize: { w: 5, h: 13, minW: 4, minH: 10 },
     },
+    conditional: {
+        label: '條件單管理',
+        description: '觸價單、二擇一、括號單集中查看、修改、暫停與取消',
+        category: 'trading',
+        pinnable: false,
+        singleton: true,
+        defaultSize: { w: 14, h: 10, minW: 4, minH: 6 },
+    },
     heatmap: {
-        label: '類股熱力圖',
-        description: '類股漲跌熱力圖',
+        label: '產業全景',
+        description: '產業資金與強弱地圖，點產業下鑽主力貢獻',
         category: 'market',
         pinnable: false,
         singleton: true,
@@ -321,7 +503,9 @@ export const BLOCK_META: Record<
     },
 };
 
-export const DEFAULT_WORKSPACE: Workspace = {
+// 預設/內建版面一律以「傳統 24 欄」撰寫（好讀好改），匯出前統一
+// 升階到 288 基準 — 見檔頭說明
+const RAW_DEFAULT_WORKSPACE: Workspace = {
     blocks: [
         { id: 'watchlist-0', type: 'watchlist', pin: null },
         { id: 'movers-0', type: 'movers', pin: null },
@@ -342,12 +526,23 @@ export const DEFAULT_WORKSPACE: Workspace = {
     ],
 };
 
-// built-in layout presets for common trading workflows
-export const LAYOUT_PRESETS: { name: string; desc: string; workspace: Workspace }[] = [
+export const DEFAULT_WORKSPACE: Workspace = upscaleLegacyWorkspace(
+    RAW_DEFAULT_WORKSPACE,
+);
+
+// 內建版面格子：最小尺寸取面板庫預設（24 欄撰寫）
+function presetCell(i: string, type: BlockType, x: number, y: number, w: number, h: number): LayoutItem {
+    const { minW, minH } = BLOCK_META[type].defaultSize;
+    return { i, x, y, w, h, minW, minH };
+}
+
+// built-in layout presets for common trading workflows（24 欄撰寫，
+// 檔尾統一升階匯出）
+const RAW_LAYOUT_PRESETS: { name: string; desc: string; workspace: Workspace }[] = [
     {
         name: '標準看盤',
         desc: '自選+排行 / K線+持倉 / 五檔+下單+明細',
-        workspace: DEFAULT_WORKSPACE,
+        workspace: RAW_DEFAULT_WORKSPACE,
     },
     {
         name: '當沖交易',
@@ -501,7 +696,7 @@ export const LAYOUT_PRESETS: { name: string; desc: string; workspace: Workspace 
     },
     {
         name: '市場脈動',
-        desc: '上市＋上櫃並排，分別觀察成分股、產業分布與貢獻傳導',
+        desc: '上市＋上櫃並排，分別觀察成分股貢獻與貢獻傳導',
         workspace: {
             blocks: [
                 {
@@ -511,9 +706,8 @@ export const LAYOUT_PRESETS: { name: string; desc: string; workspace: Workspace 
                     pulseIndex: 'IX0001',
                     pulseSections: ['flow'],
                     pulseWeights: {
-                        stocks: 28,
-                        industries: 32,
-                        flow: 40,
+                        stocks: 41,
+                        flow: 59,
                     },
                 },
                 {
@@ -523,9 +717,8 @@ export const LAYOUT_PRESETS: { name: string; desc: string; workspace: Workspace 
                     pulseIndex: 'IX0043',
                     pulseSections: ['flow'],
                     pulseWeights: {
-                        stocks: 28,
-                        industries: 32,
-                        flow: 40,
+                        stocks: 41,
+                        flow: 59,
                     },
                 },
             ],
@@ -641,10 +834,153 @@ export const LAYOUT_PRESETS: { name: string; desc: string; workspace: Workspace 
             ],
         },
     },
+    // ---- 新面板組合（條件單管理、整零價差、組合單、走勢牆、委託簿熱圖…）----
+    {
+        name: '期貨當沖',
+        desc: '台指期 K 線＋閃電＋委託簿熱圖＋明細，條件單與持倉在下方',
+        workspace: {
+            blocks: [
+                { id: 'chart-fd', type: 'chart', pin: 'TXFR1' },
+                { id: 'flash-fd', type: 'flash', pin: 'TXFR1' },
+                { id: 'depthmap-fd', type: 'depthmap', pin: 'TXFR1' },
+                { id: 'tape-fd', type: 'tape', pin: 'TXFR1' },
+                { id: 'cond-fd', type: 'conditional', pin: null },
+                { id: 'dock-fd', type: 'dock', pin: null },
+            ],
+            layout: [
+                presetCell('chart-fd', 'chart', 0, 0, 12, 15),
+                presetCell('flash-fd', 'flash', 12, 0, 5, 24),
+                presetCell('depthmap-fd', 'depthmap', 17, 0, 7, 12),
+                presetCell('tape-fd', 'tape', 17, 12, 7, 12),
+                presetCell('cond-fd', 'conditional', 0, 15, 6, 9),
+                presetCell('dock-fd', 'dock', 6, 15, 6, 9),
+            ],
+        },
+    },
+    {
+        name: '期現對照',
+        desc: '點一檔股票，現股與個股期兩條閃電梯並排，含價差對照',
+        workspace: {
+            blocks: [
+                { id: 'watch-sf', type: 'watchlist', pin: null },
+                { id: 'stockfut-sf', type: 'stockfutures', pin: null },
+                { id: 'chart-sf', type: 'chart', pin: null },
+                {
+                    id: 'flash-sfs',
+                    type: 'flash',
+                    pin: null,
+                    flashLink: { kind: 'stock', spec: 'std', month: 'near', ref: true },
+                },
+                {
+                    id: 'flash-sff',
+                    type: 'flash',
+                    pin: null,
+                    flashLink: { kind: 'future', spec: 'std', month: 'near', ref: true },
+                },
+                { id: 'dock-sf', type: 'dock', pin: null },
+            ],
+            layout: [
+                presetCell('watch-sf', 'watchlist', 0, 0, 4, 12),
+                presetCell('stockfut-sf', 'stockfutures', 0, 12, 8, 12),
+                presetCell('chart-sf', 'chart', 4, 0, 10, 12),
+                presetCell('flash-sfs', 'flash', 14, 0, 5, 24),
+                presetCell('flash-sff', 'flash', 19, 0, 5, 24),
+                presetCell('dock-sf', 'dock', 8, 12, 6, 12),
+            ],
+        },
+    },
+    {
+        name: '零股存股',
+        desc: '自選＋日 K＋籌碼，整零價差試算與兩腳送單',
+        workspace: {
+            blocks: [
+                { id: 'watch-od', type: 'watchlist', pin: null },
+                { id: 'chart-od', type: 'chart', pin: null },
+                { id: 'chips-od', type: 'chips', pin: null },
+                { id: 'dock-od', type: 'dock', pin: null },
+                { id: 'oddspread-od', type: 'oddspread', pin: null },
+            ],
+            layout: [
+                presetCell('watch-od', 'watchlist', 0, 0, 5, 24),
+                presetCell('chart-od', 'chart', 5, 0, 12, 14),
+                presetCell('chips-od', 'chips', 5, 14, 5, 10),
+                presetCell('dock-od', 'dock', 10, 14, 7, 10),
+                presetCell('oddspread-od', 'oddspread', 17, 0, 7, 24),
+            ],
+        },
+    },
+    {
+        name: '條件單監控',
+        desc: '條件單管理加寬置底，K 線＋閃電觸價欄＋通知同屏盯單',
+        workspace: {
+            blocks: [
+                { id: 'chart-cm', type: 'chart', pin: null },
+                { id: 'flash-cm', type: 'flash', pin: null },
+                { id: 'notices-cm', type: 'notices', pin: null },
+                { id: 'cond-cm', type: 'conditional', pin: null },
+                { id: 'dock-cm', type: 'dock', pin: null },
+            ],
+            layout: [
+                presetCell('chart-cm', 'chart', 0, 0, 13, 14),
+                presetCell('flash-cm', 'flash', 13, 0, 5, 14),
+                presetCell('notices-cm', 'notices', 18, 0, 6, 14),
+                presetCell('cond-cm', 'conditional', 0, 14, 14, 10),
+                presetCell('dock-cm', 'dock', 14, 14, 10, 10),
+            ],
+        },
+    },
+    {
+        name: '選擇權組合',
+        desc: 'T 字＋組合單＋損益圖，台指期 K 線與持倉在下方',
+        workspace: {
+            blocks: [
+                { id: 'opt-oc', type: 'optchain', pin: null },
+                { id: 'combo-oc', type: 'combo', pin: null },
+                { id: 'optpnl-oc', type: 'optpnl', pin: null },
+                { id: 'chart-oc', type: 'chart', pin: 'TXFR1' },
+                { id: 'dock-oc', type: 'dock', pin: null },
+            ],
+            layout: [
+                presetCell('opt-oc', 'optchain', 0, 0, 10, 14),
+                presetCell('combo-oc', 'combo', 10, 0, 6, 14),
+                presetCell('optpnl-oc', 'optpnl', 16, 0, 8, 14),
+                presetCell('chart-oc', 'chart', 0, 14, 10, 10),
+                presetCell('dock-oc', 'dock', 10, 14, 14, 10),
+            ],
+        },
+    },
+    {
+        name: '盤勢總覽',
+        desc: '大盤貢獻＋產業全景＋自選走勢牆＋排行，開盤先看全局',
+        workspace: {
+            blocks: [
+                { id: 'pulse-ov', type: 'pulse', pin: null, pulseIndex: 'IX0001' },
+                { id: 'heatmap-ov', type: 'heatmap', pin: null },
+                { id: 'wall-ov', type: 'intradaywall', pin: null },
+                { id: 'movers-ov', type: 'movers', pin: null },
+            ],
+            layout: [
+                presetCell('pulse-ov', 'pulse', 0, 0, 12, 12),
+                presetCell('heatmap-ov', 'heatmap', 12, 0, 12, 12),
+                presetCell('wall-ov', 'intradaywall', 0, 12, 16, 12),
+                presetCell('movers-ov', 'movers', 16, 12, 8, 12),
+            ],
+        },
+    },
 ];
 
-const WS_KEY = 'sj-pro-workspace-v2';
-const PROFILES_KEY = 'sj-pro-profiles-v1';
+export const LAYOUT_PRESETS: { name: string; desc: string; workspace: Workspace }[] =
+    RAW_LAYOUT_PRESETS.map((p) => ({
+        ...p,
+        workspace: upscaleLegacyWorkspace(p.workspace),
+    }));
+
+// v3 = 288 欄基準；v2（24 欄）保留原樣供舊版 app 降版使用，讀到時
+// 無損升階。profiles 同理。
+const WS_KEY = 'sj-pro-workspace-v3';
+const WS_KEY_LEGACY = 'sj-pro-workspace-v2';
+const PROFILES_KEY = 'sj-pro-profiles-v2';
+const PROFILES_KEY_LEGACY = 'sj-pro-profiles-v1';
 
 function validWorkspace(w: unknown): w is Workspace {
     if (!w || typeof w !== 'object') return false;
@@ -656,11 +992,22 @@ function validWorkspace(w: unknown): w is Workspace {
 }
 
 export function loadWorkspace(): Workspace {
+    // 兩個 key 各自 try — corrupt v3 不能擋掉 v2 fallback
     try {
         const raw = localStorage.getItem(WS_KEY);
         if (raw) {
             const w = JSON.parse(raw);
             if (validWorkspace(w)) return w;
+        }
+    } catch {
+        // fall through to legacy
+    }
+    try {
+        // 舊 24 欄存檔 → ×12 無損升階（v2 key 原樣保留，降版安全）
+        const legacy = localStorage.getItem(WS_KEY_LEGACY);
+        if (legacy) {
+            const w = JSON.parse(legacy);
+            if (validWorkspace(w)) return upscaleLegacyWorkspace(w);
         }
     } catch {
         // fall through
@@ -673,23 +1020,37 @@ export function saveWorkspace(w: Workspace) {
 }
 
 export function loadProfiles(): Profile[] {
+    const parse = (raw: string, legacy: boolean): Profile[] | null => {
+        const arr = JSON.parse(raw);
+        if (!Array.isArray(arr)) return null;
+        return (arr as Profile[])
+            .filter(
+                (p) =>
+                    typeof p.name === 'string' && validWorkspace(p.workspace),
+            )
+            .map((p) => {
+                const ws = legacy
+                    ? upscaleLegacyWorkspace(p.workspace)
+                    : p.workspace;
+                return typeof p.icon === 'string' && p.icon
+                    ? { ...p, workspace: ws }
+                    : { name: p.name, workspace: ws };
+            });
+    };
     try {
         const raw = localStorage.getItem(PROFILES_KEY);
         if (raw) {
-            const arr = JSON.parse(raw);
-            if (Array.isArray(arr)) {
-                return (arr as Profile[])
-                    .filter(
-                        (p) =>
-                            typeof p.name === 'string' &&
-                            validWorkspace(p.workspace),
-                    )
-                    .map((p) =>
-                        typeof p.icon === 'string' && p.icon
-                            ? p
-                            : { name: p.name, workspace: p.workspace },
-                    );
-            }
+            const out = parse(raw, false);
+            if (out) return out;
+        }
+    } catch {
+        // fall through to legacy
+    }
+    try {
+        const legacy = localStorage.getItem(PROFILES_KEY_LEGACY);
+        if (legacy) {
+            const out = parse(legacy, true);
+            if (out) return out;
         }
     } catch {
         // fall through
@@ -705,4 +1066,13 @@ let blockCounter = Date.now() % 100000;
 export function newBlockId(type: BlockType): string {
     blockCounter += 1;
     return `${type}-${blockCounter}`;
+}
+
+// Merge a partial update into one block (panel settings persisted with the
+// workspace / layout library).
+export function withBlockPatch(w: Workspace, id: string, patch: Partial<Block>): Workspace {
+    return {
+        ...w,
+        blocks: w.blocks.map((block) => (block.id === id ? { ...block, ...patch } : block)),
+    };
 }

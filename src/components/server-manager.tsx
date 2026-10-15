@@ -4,10 +4,7 @@
 import {
     Clipboard,
     Download,
-    Eye,
-    EyeOff,
     ExternalLink,
-    FileUp,
     Lock,
     LogOut,
     Play,
@@ -16,19 +13,39 @@ import {
     Settings,
     ShieldCheck,
     Square,
-    X,
 } from 'lucide-react';
 import {
     useCallback,
     useEffect,
+    useRef,
     useState,
     useSyncExternalStore,
 } from 'react';
 import { usePoll } from '../hooks/use-poll';
 import { useStreamStatus } from '../hooks/use-stream';
+import { unsignedAccountLabel } from '../lib/account-signing';
+import { canTrade } from '../lib/account-tradable';
+import { getPrivacyMode, maskAccountId } from '../lib/privacy';
 import { EXPECTED_SERVER_VERSION } from '../lib/runtime';
 import { diagnoseOutput, errorLines, validateDesktopSettings } from '../lib/server-diagnostics';
 import { clearStoredSpawnKeyHash } from '../lib/spawn-keys';
+import {
+    STALE_RUN_MS,
+    applyScenario,
+    describeActiveStage,
+    getActiveTiming,
+    peekActiveTiming,
+    subscribeTiming,
+    timingDiagnostics,
+    type TimingScenario,
+} from '../lib/startup-timing';
+import {
+    timedRestart,
+    timedStart,
+    timedStop,
+    type ServerActionDeps,
+} from '../lib/server-actions';
+import { freshDiagnostics } from '../lib/diagnostics-snapshot';
 import {
     fetchAccounts,
     fetchCaExpire,
@@ -43,22 +60,40 @@ import {
     isTauri,
     loadDesktopSettings,
     openLatestRelease,
-    pickCaFile,
-    pickEnvFile,
     reloadWhenHealthy,
     restartAndInstallUpdate,
     saveDesktopSettings,
+    subscribeAgentHarnessEnabled,
     serverStart,
     serverStatus,
     serverStop,
+    stopAgentsForServerChange,
     subscribeAppUpdateState,
     type DesktopSettings,
     type ServerStatus,
 } from '../lib/tauri';
 import { notify } from '../lib/trade';
 import { Orb } from './orb';
+import { ServerSettingsDialog, type ServerConnectionSettings } from './server-settings-dialog';
+import * as dialogStyles from './server-settings-dialog.css';
 import type { Health } from '../lib/types/health';
+import { setServerIdentityVerified } from '../lib/server-identity';
 import * as styles from './hud-header.css';
+
+const serverActionDeps: ServerActionDeps = {
+    serverStart,
+    serverStop,
+    reloadWhenHealthy: () => reloadWhenHealthy(),
+    reloadAfterFailedStop: () => {
+        // A refused stop may leave the old listener healthy or warming.
+        // Reboot the page; boot verifies identity and keeps watching if it
+        // is not yet healthy. The mutation gate stays closed meanwhile.
+        setTimeout(() => globalThis.window?.location?.reload?.(), 0);
+    },
+    scheduleReload: (ms) => {
+        setTimeout(() => globalThis.window?.location?.reload?.(), ms);
+    },
+};
 
 // "9h" reads fine but "0h" while the token auto-renews in minutes is
 // misleading — show minutes below two hours
@@ -83,16 +118,42 @@ export function ServerManager({
         caPath: '',
         caPasswd: '',
         httpsEnabled: false,
+        agentHarnessEnabled: true,
     });
     const [busy, setBusy] = useState(false);
     const [lastOutput, setLastOutput] = useState('');
     const [ver, setVer] = useState('');
     const [checking, setChecking] = useState(false);
     const [readyLines, setReadyLines] = useState<string[]>([]);
-    const [showPw, setShowPw] = useState(false);
     const [confirmLogout, setConfirmLogout] = useState(false);
-    const [envMsg, setEnvMsg] = useState('');
+    const logoutInFlight = useRef(false);
     const [settingsOpen, setSettingsOpen] = useState(false);
+    const settingsButton = useRef<HTMLButtonElement>(null);
+    const [settingsLoaded, setSettingsLoaded] = useState(false);
+    const [settingsLoadError, setSettingsLoadError] = useState('');
+    const [savedForRestart, setSavedForRestart] = useState(false);
+    const restartError = useRef('');
+    // in-flight start/restart/stop/switch run (issue #142) + a 1 s tick so
+    // the elapsed seconds move while it lasts
+    const timingRun = useSyncExternalStore(
+        subscribeTiming,
+        peekActiveTiming,
+        peekActiveTiming,
+    );
+    const [, setTimingTick] = useState(0);
+    useEffect(() => {
+        if (!timingRun) return;
+        const t = setInterval(() => {
+            if (Date.now() - timingRun.startedAt > STALE_RUN_MS) {
+                // nobody closed it: retire it (re-renders with no run)
+                clearInterval(t);
+                getActiveTiming();
+                return;
+            }
+            setTimingTick((v) => v + 1);
+        }, 1000);
+        return () => clearInterval(t);
+    }, [timingRun]);
     const updateState = useSyncExternalStore(
         subscribeAppUpdateState,
         getAppUpdateState,
@@ -124,7 +185,7 @@ export function ServerManager({
         try {
             const info = await fetchInfo().catch(() => null);
             out.push(
-                info?.simulation
+                !info ? '環境：未知（無法讀取伺服器資訊）' : info.simulation
                     ? '環境：模擬（下單不需 CA）'
                     : '環境：⚠ 正式（下單需 CA＋已簽署帳戶）',
             );
@@ -137,8 +198,8 @@ export function ServerManager({
                           ? '期貨'
                           : a.account_type;
                 out.push(
-                    `${a.signed ? '✓' : '✗'} ${kind} ${a.broker_id}-${a.account_id}` +
-                        `${a.signed ? ' 已簽署' : ' 未簽署 API 約定書（無法下單）'}`,
+                    `${canTrade(a) ? '✓' : '✗'} ${kind} ${a.broker_id}-${maskAccountId(a.account_id, getPrivacyMode())}` +
+                        `${a.signed ? ' 已簽署' : ` ${unsignedAccountLabel(info?.simulation === true)}`}`,
                 );
             }
             const pid = accounts[0]?.person_id;
@@ -168,21 +229,11 @@ export function ServerManager({
         appVersion().then(setVer);
     }, []);
 
-    // Esc 關閉設定 dialog
-    useEffect(() => {
-        if (!settingsOpen) return;
-        const onKey = (e: KeyboardEvent) => {
-            if (e.key === 'Escape') setSettingsOpen(false);
-        };
-        window.addEventListener('keydown', onKey);
-        return () => window.removeEventListener('keydown', onKey);
-    }, [settingsOpen]);
-
     // safety net: never let a stuck sidecar promise pin 啟動中 / disable the
     // buttons forever — auto-clear busy after 75s (a production login + CA +
     // contract load is well under that)
     useEffect(() => {
-        if (!busy) return;
+        if (!busy || logoutInFlight.current) return;
         const t = setTimeout(() => setBusy(false), 75_000);
         return () => clearTimeout(t);
     }, [busy]);
@@ -192,30 +243,32 @@ export function ServerManager({
         useCallback(() => serverStatus(), []),
         8000,
     );
+    const polledStatus = status;
     const { data: health } = usePoll<Health | null>(
         useCallback(() => fetchHealth().catch(() => null), []),
         15000,
     );
+    const polledHealth = health ?? undefined;
 
     useEffect(() => {
-        loadDesktopSettings().then(setSettings);
+        loadDesktopSettings().then(value => { setSettings(value); setSettingsLoaded(true); }).catch(() => setSettingsLoadError('無法讀取本機設定，請重新開啟 App 後重試。'));
     }, []);
+
+    useEffect(
+        () =>
+            subscribeAgentHarnessEnabled((agentHarnessEnabled) =>
+                setSettings((current) => ({
+                    ...current,
+                    agentHarnessEnabled,
+                })),
+            ),
+        [],
+    );
 
     const persist = (next: Partial<DesktopSettings>) => {
         const merged = { ...settings, ...next };
         setSettings(merged);
         void saveDesktopSettings(merged);
-    };
-
-    const importEnv = async () => {
-        const found = await pickEnvFile();
-        if (!found) return; // dialog cancelled
-        if (found.error) {
-            setEnvMsg(found.error);
-            return;
-        }
-        setEnvMsg('');
-        persist(found);
     };
 
     const copyDiagnostics = async () => {
@@ -228,8 +281,17 @@ export function ServerManager({
         } catch {
             // older shell without the command
         }
+        // #287: read now — the polled values can still be the busy boot
+        // window's (healthy=false, health: —) right after a restart
+        const fresh = await freshDiagnostics(
+            () => serverStatus(),
+            signal => fetchHealth({ signal }),
+            { status: polledStatus, health: polledHealth },
+        );
+        const status = fresh.status;
+        const health = fresh.health ?? null;
         const lines = [
-            `Shioaji Pro v${ver || '?'} · ${host}`,
+            `Shioaji Pro ${ver || '?'} · ${host}`,
             status?.running
                 ? `server: running v${status.version ?? '?'} (expected v${
                       EXPECTED_SERVER_VERSION || '—'
@@ -248,6 +310,12 @@ export function ServerManager({
                                     : `expires in ${health.ca_expires_in_days}d`
                             }`
                           : ''
+                  }${
+                      health.session_recovering
+                          ? ` · session RECOVERING (attempt ${
+                                health.session_recovery_attempts ?? '?'
+                            })`
+                          : ''
                   }`
                 : 'health: —',
             `stream: ${stream} · mode setting: ${
@@ -256,6 +324,7 @@ export function ServerManager({
                 settings.httpsEnabled ? 'on' : 'off'
             } · autostart: ${settings.autoStart ? 'on' : 'off'}`,
             lastOutput ? `--- log ---\n${lastOutput}` : '',
+            timingDiagnostics(),
         ].filter(Boolean);
         try {
             await navigator.clipboard.writeText(lines.join('\n'));
@@ -278,23 +347,34 @@ export function ServerManager({
     // (two-click confirm mirrors watchlist.tsx's delete-list pattern).
     // Logout also STOPS our own server (issue #16): leaving it running means
     // the next login adopts a server still logged into the OLD credentials.
-    // serverStop() without allowExternal never touches a user's own daemon.
+    // Native ownership checks keep external daemons outside App stop actions.
     const doLogout = () => {
+        if (busy || logoutInFlight.current) return;
         if (!confirmLogout) {
             setConfirmLogout(true);
-            setTimeout(() => setConfirmLogout(false), 2500);
             return;
         }
+        logoutInFlight.current = true;
+        setBusy(true);
         setConfirmLogout(false);
         void (async () => {
-            await serverStop().catch(() => undefined);
-            clearStoredSpawnKeyHash();
-            await saveDesktopSettings({
-                ...settings,
-                apiKey: '',
-                secretKey: '',
-            });
-            window.location.reload();
+            try {
+                setServerIdentityVerified(false);
+                const stopped = await serverStop({ stopAgents: true });
+                if (!stopped.ok) {
+                    serverActionDeps.reloadAfterFailedStop();
+                    throw new Error(stopped.output || '無法停止本機伺服器');
+                }
+                const current = await loadDesktopSettings();
+                await saveDesktopSettings({ ...current, apiKey: '', secretKey: '' });
+                clearStoredSpawnKeyHash();
+                window.location.reload();
+            } catch (e) {
+                notify({ kind: 'err', title: '登出未完成', body: e instanceof Error ? e.message : String(e) });
+            } finally {
+                logoutInFlight.current = false;
+                setBusy(false);
+            }
         })();
     };
 
@@ -303,15 +383,21 @@ export function ServerManager({
     // (issue #2: charts/watchlist froze after restart until manual reload)
     // cfg override lets 啟用/停用 HTTPS restart with the just-persisted
     // settings instead of the stale closure state
-    const doStart = async (cfg: DesktopSettings = settings) => {
+    const doStart = async (
+        cfg: DesktopSettings = settings,
+        scenario: TimingScenario = 'start',
+        nested = false, // called by doRestart, which owns the timing run
+    ) => {
         const err = validateDesktopSettings(cfg);
         if (err) {
             notify({ kind: 'err', ...err });
-            return;
+            return false;
         }
         setBusy(true);
         try {
-            const res = await serverStart(cfg);
+            // also hands the run to the health wait / reload
+            // (reload once healthy, or right away when the port moved)
+            const res = await timedStart(cfg, scenario, serverActionDeps, nested);
             // keep the tail — start failures put the ERROR line last
             setLastOutput(res.output.slice(-600));
             notify({
@@ -327,14 +413,11 @@ export function ServerManager({
                       errorLines(res.output) ||
                       res.output.slice(-120),
             });
-            if (res.ok) {
-                // reload once healthy (or immediately when the port moved)
-                if (res.portChanged) {
-                    setTimeout(() => window.location.reload(), 1800);
-                } else if (!res.attached) {
-                    reloadWhenHealthy();
-                }
-            }
+            if (res.ok) setSavedForRestart(false);
+            return res.ok;
+        } catch (e) {
+            notify({ kind: 'err', title: '伺服器啟動失敗', body: e instanceof Error ? e.message : String(e) });
+            return false;
         } finally {
             setBusy(false);
             setTimeout(refresh, 1500);
@@ -344,7 +427,7 @@ export function ServerManager({
     const doStop = async () => {
         setBusy(true);
         try {
-            const res = await serverStop({ allowExternal: true });
+            const res = await timedStop(serverActionDeps);
             setLastOutput(res.output.slice(-600));
             notify({
                 kind: res.ok ? 'ok' : 'err',
@@ -357,14 +440,50 @@ export function ServerManager({
         }
     };
 
-    const doRestart = async (cfg: DesktopSettings = settings) => {
+    const doRestart = async (
+        cfg: DesktopSettings = settings,
+        scenario: TimingScenario = 'restart',
+    ) => {
+        restartError.current = '';
+        const error = validateDesktopSettings(cfg);
+        if (error) { notify({ kind: 'err', ...error }); return false; }
         setBusy(true);
         try {
-            await serverStop({ allowExternal: true });
-            await new Promise((r) => setTimeout(r, 1200));
-            await doStart(cfg);
-        } finally {
-            setBusy(false);
+            const { stopped, started } = await timedRestart(scenario, serverActionDeps, () => doStart(cfg, scenario, true));
+            if (!stopped.ok) {
+                restartError.current = stopped.output;
+                notify({ kind: 'err', title: '未能停止伺服器，已取消重啟', body: stopped.output.slice(-200) });
+                return false;
+            }
+            return started;
+        } catch (e) {
+            restartError.current = e instanceof Error ? e.message : String(e);
+            notify({ kind: 'err', title: '重啟失敗', body: e instanceof Error ? e.message : String(e) });
+            return false;
+        } finally { setBusy(false); }
+    };
+
+    const saveConnectionSettings = async (draft: ServerConnectionSettings, apply: boolean) => {
+        if (logoutInFlight.current) throw new Error('正在登出，請等待完成。');
+        restartError.current = '';
+        // Re-read settings so saving this form cannot revert another panel's
+        // Harness/autostart/TLS setting while the dialog was open.
+        const current = await loadDesktopSettings();
+        const next = { ...current, ...draft };
+        if (apply) {
+            const error = validateDesktopSettings(next);
+            if (error) throw new Error(`${error.title}：${error.body}`);
+            // Do not save a new environment if a native Agent cannot be stopped.
+            await stopAgentsForServerChange();
+        }
+        await saveDesktopSettings(next);
+        setSettings(next);
+        setSavedForRestart(true);
+        if (apply) {
+            // a mode flip against the running server is timed as a switch
+            const scenario = applyScenario(!!status?.running, status?.simulation, next.production);
+            const ok = status?.running ? await doRestart(next, scenario) : await doStart(next, scenario);
+            if (!ok) throw new Error(`設定已儲存，但伺服器未能套用。${restartError.current || '請查看狀態面板的錯誤後再試。'}`);
         }
     };
 
@@ -413,26 +532,35 @@ export function ServerManager({
     if (!isTauri) return null;
 
     const running = status?.running && status.healthy;
+    // 1.7.3+：後端 Solace session 斷線自癒中 — SSE 可能還掛著（甚至
+    // 還在收最後的行情）但資料端點全 500，指示燈不能是綠的（#28）
+    const sessionRecovering = !!status?.running && !!health?.session_recovering;
     // explicit lifecycle so starting/connecting never looks stuck. A LIVE
     // quote stream means the server is up and serving — that must beat a
     // still-pending `busy` (the sidecar `server start` can stay awaited well
     // after the daemon is live), otherwise it sticks on 啟動中 forever.
-    const phase: 'starting' | 'connecting' | 'ok' | 'down' =
-        running && stream === 'live'
-            ? 'ok'
-            : stream === 'live'
-              ? 'connecting' // data flowing, health not confirmed yet
-              : busy
-                ? 'starting'
-                : status?.running || stream === 'connecting'
-                  ? 'connecting'
-                  : 'down';
+    const phase: 'starting' | 'connecting' | 'recovering' | 'ok' | 'down' =
+        sessionRecovering
+            ? 'recovering'
+            : running && stream === 'live'
+              ? 'ok'
+              : stream === 'live'
+                ? 'connecting' // data flowing, health not confirmed yet
+                : busy
+                  ? 'starting'
+                  : status?.running || stream === 'connecting'
+                    ? 'connecting'
+                    : 'down';
+    // current start/restart/stop/switch stage, when one is being timed
+    const stageText = describeActiveStage(timingRun);
     const phaseLabel =
         phase === 'starting'
             ? '啟動中…'
             : phase === 'connecting'
               ? '連線中…'
-              : '伺服器';
+              : phase === 'recovering'
+                ? '行情恢復中…'
+                : '伺服器';
     const updatePercent =
         updateState.totalBytes && updateState.downloadedBytes !== undefined
             ? Math.min(
@@ -497,7 +625,9 @@ export function ServerManager({
                     <Download size={11} />
                 ) : updateState.phase === 'external' ? (
                     <ExternalLink size={11} />
-                ) : phase === 'starting' || phase === 'connecting' ? (
+                ) : phase === 'starting' ||
+                  phase === 'connecting' ||
+                  phase === 'recovering' ? (
                     <Orb size={12} variant='ring' style={{ color: 'var(--amber, #e0a43c)' }} />
                 ) : (
                     <span
@@ -512,7 +642,7 @@ export function ServerManager({
                         className={styles.popoverBackdrop}
                         onClick={() => onToggle(false)}
                     />
-                    <div className={styles.popover} style={{ width: '19rem' }}>
+                    <div className={styles.popover} style={{ width: '19rem', display: settingsOpen ? 'none' : undefined }}>
                         <span
                             className={styles.settingLabel}
                             style={{
@@ -541,7 +671,7 @@ export function ServerManager({
                                     {serverVersion
                                         ? `Server v${serverVersion}`
                                         : 'Server —'}
-                                    {ver && ` · App v${ver}`}
+                                    {ver && ` · App ${ver}`}
                                 </span>
                             )}
                         </span>
@@ -556,7 +686,8 @@ export function ServerManager({
                         )}
                         <div className={styles.srvPhaseRow}>
                             {phase === 'starting' ||
-                            phase === 'connecting' ? (
+                            phase === 'connecting' ||
+                            phase === 'recovering' ? (
                                 <Orb size={12} variant='ring' style={{ color: 'var(--amber, #e0a43c)' }} />
                             ) : (
                                 <span
@@ -567,15 +698,23 @@ export function ServerManager({
                                     }
                                 />
                             )}
-                            {phase === 'starting'
+                            {stageText && phase !== 'ok' && phase !== 'recovering'
+                                ? stageText
+                                : phase === 'starting'
                                 ? '啟動中 — 登入與載入合約約需 10–30 秒'
-                                : phase === 'connecting'
-                                  ? status?.running
-                                      ? '已啟動，等待行情連線'
-                                      : '連線中'
-                                  : status?.running
-                                    ? '運行中'
-                                    : '未運行'}
+                                : phase === 'recovering'
+                                  ? `行情連線中斷 — 自動恢復中${
+                                        health?.session_recovery_attempts
+                                            ? `（第 ${health.session_recovery_attempts} 次重試）`
+                                            : '…'
+                                    }`
+                                  : phase === 'connecting'
+                                    ? status?.running
+                                        ? '已啟動，等待行情連線'
+                                        : '連線中'
+                                    : status?.running
+                                      ? '運行中'
+                                      : '未運行'}
                         </div>
                         {status?.running && (
                             <div className={styles.srvChipRow}>
@@ -644,6 +783,7 @@ export function ServerManager({
                             </div>
                         )}
                         {(phase === 'starting' ||
+                            phase === 'recovering' ||
                             (phase === 'connecting' && status?.running)) && (
                             <span className={styles.progressTrack}>
                                 <span className={styles.progressGlider} />
@@ -673,10 +813,12 @@ export function ServerManager({
                                 API 金鑰；或切回模擬後按「重啟」
                             </span>
                         )}
+                        {savedForRestart && <p role='status' className={styles.emptyHint}>設定已儲存，下次啟動或重啟時套用。</p>}
+                        {settingsLoadError && <p role='alert' className={styles.emptyHint}>{settingsLoadError}</p>}
                         <div className={styles.settingGroup}>
                             <button
                                 className={styles.opt.off}
-                                disabled={busy}
+                                disabled={busy || !settingsLoaded || !!status?.running}
                                 onClick={() => doStart()}
                             >
                                 <Play size={11} style={{ verticalAlign: '-1px' }} />{' '}
@@ -684,7 +826,7 @@ export function ServerManager({
                             </button>
                             <button
                                 className={styles.opt.off}
-                                disabled={busy}
+                                disabled={busy || !settingsLoaded || !status?.running}
                                 onClick={() => doRestart()}
                             >
                                 <RotateCcw size={11} style={{ verticalAlign: '-1px' }} />{' '}
@@ -692,13 +834,14 @@ export function ServerManager({
                             </button>
                             <button
                                 className={styles.opt.off}
-                                disabled={busy}
+                                disabled={busy || !status?.running}
                                 onClick={doStop}
                             >
                                 <Square size={10} style={{ verticalAlign: '-1px' }} />{' '}
                                 停止
                             </button>
                         </div>
+                        <p className={styles.emptyHint}>重啟或停止會一併停止本 App 的 Agent，並撤銷本次 Auto 授權。</p>
 
                         <div className={styles.switchRow}>
                             <span className={styles.switchLabel}>
@@ -722,7 +865,10 @@ export function ServerManager({
                                         settings.httpsEnabled ? 'on' : 'off'
                                     ]
                                 }
-                                disabled={busy || httpsBusy}
+                                role='switch'
+                                aria-label='本機 HTTPS（切換後重啟伺服器）'
+                                aria-checked={settings.httpsEnabled}
+                                disabled={busy || httpsBusy || !settingsLoaded}
                                 title={
                                     settings.httpsEnabled
                                         ? '停用並改回 HTTP'
@@ -764,6 +910,10 @@ export function ServerManager({
                                         settings.autoStart ? 'on' : 'off'
                                     ]
                                 }
+                                role='switch'
+                                aria-label='App 啟動時自動啟動伺服器'
+                                aria-checked={settings.autoStart}
+                                disabled={!settingsLoaded || busy}
                                 onClick={() =>
                                     persist({
                                         autoStart: !settings.autoStart,
@@ -874,306 +1024,52 @@ export function ServerManager({
                         </div>
                         <button
                             className={styles.updateBtn}
-                            onClick={() => setSettingsOpen(true)}
+                            disabled={!settingsLoaded || busy}
+                            ref={settingsButton}
+                            onClick={() => { setReadyLines([]); setSettingsOpen(true); }}
                         >
                             <Settings size={13} />
                             完整設定…
                         </button>
                     </div>
-                    {settingsOpen && (
-                        <>
-                            <div
-                                className={styles.srvDialogBackdrop}
-                                onClick={() => setSettingsOpen(false)}
-                            />
-                            <div className={styles.srvDialog}>
-                                <div className={styles.srvDialogTitle}>
-                                    伺服器設定
-                                    <button
-                                        className={styles.profileDelete}
-                                        title='關閉（Esc）'
-                                        onClick={() => setSettingsOpen(false)}
-                                    >
-                                        <X size={12} />
-                                    </button>
-                                </div>
-                        <span className={styles.settingLabel}>
-                            API 金鑰（儲存在本機 App 資料夾）
-                        </span>
-                        <input
-                            className={styles.saveInput}
-                            type='password'
-                            placeholder='SJ_API_KEY'
-                            value={settings.apiKey}
-                            onChange={(e) =>
-                                persist({ apiKey: e.target.value })
-                            }
-                        />
-                        <input
-                            className={styles.saveInput}
-                            type='password'
-                            placeholder='SJ_SEC_KEY'
-                            value={settings.secretKey}
-                            onChange={(e) =>
-                                persist({ secretKey: e.target.value })
-                            }
-                        />
-                        <button className={styles.updateBtn} onClick={importEnv}>
-                            <FileUp size={13} />
-                            選資料夾自動讀取 .env
-                        </button>
-                        {envMsg && (
-                            <span
-                                className={styles.emptyHint}
-                                style={{ color: 'var(--danger, #f23645)' }}
-                            >
-                                {envMsg}
-                            </span>
-                        )}
-                        <div className={styles.srvSection}>
-                        <span className={styles.settingLabel}>環境</span>
-                        <div className={styles.settingGroup}>
-                            <button
-                                className={
-                                    styles.opt[
-                                        settings.production ? 'off' : 'on'
-                                    ]
-                                }
-                                onClick={() =>
-                                    persist({ production: false })
-                                }
-                            >
-                                模擬
+                    {settingsOpen && <ServerSettingsDialog
+                        settings={settings} status={status} busy={busy || httpsBusy}
+                        pendingApply={savedForRestart || (!!status?.running && status.simulation === settings.production)}
+                        onSave={saveConnectionSettings} onClose={() => {
+                            setSettingsOpen(false);
+                            // macOS does not necessarily focus a button on click.
+                            // Restore explicitly after the popover becomes visible.
+                            requestAnimationFrame(() => settingsButton.current?.focus());
+                        }}
+                    >
+                        <details className={dialogStyles.details}>
+                            <summary>目前連線診斷</summary>
+                            <p className={dialogStyles.hint}>檢查正在運行的伺服器，表單中的未套用設定不會納入檢查。</p>
+                            <button className={dialogStyles.button} onClick={runReadyCheck} disabled={checking || !status?.running}>
+                                <ShieldCheck size={14} />{checking ? '檢查中…' : '檢查目前帳戶／CA'}
                             </button>
-                            <button
-                                className={
-                                    styles.opt[
-                                        settings.production ? 'on' : 'off'
-                                    ]
-                                }
-                                onClick={() => persist({ production: true })}
-                            >
-                                ⚠ 正式
-                            </button>
-                        </div>
-                        {settings.production && (
-                            <span
-                                className={styles.emptyHint}
-                                style={{ color: 'var(--danger, #f23645)' }}
-                            >
-                                正式環境下單動用真實資金，重啟後生效
-                            </span>
-                        )}
-                        <span className={styles.settingLabel}>
-                            憑證（正式環境下單必要，模擬不需要）
-                        </span>
-                        <div className={styles.saveRow}>
-                            <button
-                                className={styles.resetBtn}
-                                style={{ flex: 1, minWidth: 0 }}
-                                title={
-                                    settings.caPath ||
-                                    '從 API 管理頁下載的 Sinopac.pfx'
-                                }
-                                onClick={async () => {
-                                    const path = await pickCaFile();
-                                    if (path) persist({ caPath: path });
-                                }}
-                            >
-                                {settings.caPath
-                                    ? `✓ ${settings.caPath.split(/[/\\]/).pop()}`
-                                    : '選擇 Sinopac.pfx…'}
-                            </button>
-                            {settings.caPath && (
-                                <button
-                                    className={styles.profileDelete}
-                                    title='清除憑證設定'
-                                    onClick={() =>
-                                        persist({ caPath: '', caPasswd: '' })
-                                    }
-                                >
-                                    <X size={10} />
+                            {caError && <p className={dialogStyles.warning}>{caError}</p>}
+                            {readyLines.length > 0 && <div role='status' className={dialogStyles.notice}>{readyLines.map((line, i) => <div key={i}>{line}</div>)}</div>}
+                        </details>
+                        <details className={dialogStyles.details}>
+                            <summary>App 更新與問題回報</summary>
+                            <div className={dialogStyles.row}>
+                                <button className={dialogStyles.button} onClick={runUpdateAction} disabled={updateBusy}>
+                                    <RefreshCw size={14} />{updateState.phase === 'ready' ? `重新啟動並更新 v${updateState.version}` : updateState.phase === 'external' ? `前往下載 v${updateState.version}` : updateBusy ? '正在檢查／下載更新…' : '檢查 App 更新'}
                                 </button>
-                            )}
-                        </div>
-                        {settings.caPath && (
-                            <div
-                                className={styles.saveRow}
-                                style={{ position: 'relative' }}
-                            >
-                                <input
-                                    className={styles.saveInput}
-                                    style={{ flex: 1, paddingRight: '30px' }}
-                                    type={showPw ? 'text' : 'password'}
-                                    placeholder='憑證密碼（下載時設定）'
-                                    value={settings.caPasswd}
-                                    onChange={(e) =>
-                                        persist({ caPasswd: e.target.value })
-                                    }
-                                />
-                                <button
-                                    className={styles.resetBtn}
-                                    style={{
-                                        position: 'absolute',
-                                        right: '4px',
-                                        top: '50%',
-                                        transform: 'translateY(-50%)',
-                                        padding: '2px 6px',
-                                        border: 'none',
-                                        background: 'transparent',
-                                    }}
-                                    title={showPw ? '隱藏密碼' : '顯示密碼'}
-                                    onClick={() => setShowPw((v) => !v)}
-                                >
-                                    {showPw ? (
-                                        <EyeOff size={13} />
-                                    ) : (
-                                        <Eye size={13} />
-                                    )}
-                                </button>
+                                <button className={dialogStyles.button} onClick={() => void copyDiagnostics()}><Clipboard size={14} />複製診斷資訊</button>
                             </div>
-                        )}
-                        {caError && (
-                            <span
-                                className={styles.emptyHint}
-                                style={{
-                                    color: 'var(--danger, #f23645)',
-                                    fontWeight: 600,
-                                }}
-                            >
-                                ⚠ {caError}
-                            </span>
-                        )}
-                        {settings.production && !settings.caPath && (
-                            <span
-                                className={styles.emptyHint}
-                                style={{ color: 'var(--danger, #f23645)' }}
-                            >
-                                尚未設定憑證 — 正式環境無法下單。請至
-                                sinotrade.com.tw API 管理頁下載 Sinopac.pfx
-                            </span>
-                        )}
-                        <button
-                            className={styles.updateBtn}
-                            onClick={runReadyCheck}
-                            disabled={checking}
-                        >
-                            <ShieldCheck size={13} />
-                            {checking ? '檢查中…' : '下單就緒檢查（CA／帳戶）'}
-                        </button>
-                        {readyLines.length > 0 && (
-                            <div
-                                className={styles.emptyHint}
-                                style={{
-                                    fontFamily: 'var(--font-mono, monospace)',
-                                    lineHeight: 1.6,
-                                    whiteSpace: 'pre-wrap',
-                                }}
-                            >
-                                {readyLines.map((l, i) => (
-                                    <div
-                                        key={i}
-                                        style={
-                                            l.startsWith('✗') || l.startsWith('⚠')
-                                                ? { color: 'var(--danger, #f23645)' }
-                                                : undefined
-                                        }
-                                    >
-                                        {l}
-                                    </div>
-                                ))}
-                            </div>
-                        )}
-                        </div>
-                        <div className={styles.srvSection}>
-                            <span className={styles.settingLabel}>進階</span>
-                        <button
-                            className={styles.updateBtn}
-                            onClick={runUpdateAction}
-                            disabled={updateBusy}
-                        >
-                            {updateState.phase === 'ready' ? (
-                                <RotateCcw size={13} />
-                            ) : updateState.phase === 'external' ? (
-                                <ExternalLink size={13} />
-                            ) : updateState.phase === 'downloading' ? (
-                                <Download size={13} />
-                            ) : (
-                                <RefreshCw size={13} />
-                            )}
-                            {updateState.phase === 'checking'
-                                ? '正在檢查更新…'
-                                : updateState.phase === 'available'
-                                  ? `找到 v${updateState.version}`
-                                  : updateState.phase === 'downloading'
-                                    ? `下載 v${updateState.version}${
-                                          updatePercent === undefined
-                                              ? '…'
-                                              : ` · ${updatePercent}%`
-                                      }`
-                                    : updateState.phase === 'ready'
-                                      ? `重新啟動並更新 v${updateState.version}`
-                                      : updateState.phase === 'installing'
-                                        ? '正在安裝更新…'
-                                        : updateState.phase === 'external'
-                                          ? `前往下載 v${updateState.version}`
-                                          : updateState.phase === 'error'
-                                            ? '重試檢查更新'
-                                            : '檢查 App 更新'}
-                        </button>
-                        {updateState.phase === 'downloading' && (
-                            <span className={styles.emptyHint}>
-                                更新會在背景下載，完成後再由你決定何時重新啟動。
-                            </span>
-                        )}
-                        {updateState.phase === 'ready' && (
-                            <span className={styles.emptyHint}>
-                                已下載完成；按上方按鈕後才會安裝並重新啟動 App。
-                            </span>
-                        )}
-                        {updateState.phase === 'external' && (
-                            <span className={styles.emptyHint}>
-                                RPM／DEB 安裝版不會在 App 內要求系統權限，請下載新版套件或由套件管理器更新。
-                            </span>
-                        )}
-                        {updateState.phase === 'error' && updateState.error && (
-                            <span
-                                className={styles.emptyHint}
-                                style={{ color: 'var(--danger, #f23645)' }}
-                            >
-                                更新失敗：{updateState.error}
-                            </span>
-                        )}
-                        <button
-                            className={styles.updateBtn}
-                            onClick={() => void copyDiagnostics()}
-                        >
-                            <Clipboard size={13} />
-                            複製診斷資訊
-                        </button>
-                        </div>
-                        <div className={styles.srvDanger}>
-                            <span
-                                className={styles.settingLabel}
-                                style={{ color: 'var(--danger, #f23645)' }}
-                            >
-                                危險區
-                            </span>
-                        <button
-                            className={
-                                confirmLogout
-                                    ? styles.killBtnOn
-                                    : styles.killBtnOff
-                            }
-                            onClick={doLogout}
-                        >
-                            <LogOut size={13} />
-                            {confirmLogout ? '再按一次確認登出' : '登出（清除 API 金鑰）'}
-                        </button>
-                        </div>
-                            </div>
-                        </>
-                    )}
+                            {updateState.phase === 'ready' && <p className={dialogStyles.hint}>更新已下載，按上方按鈕才會安裝並重新啟動 App。</p>}
+                            {updateState.phase === 'error' && <p className={dialogStyles.warning}>{updateState.error}</p>}
+                        </details>
+                        <details className={dialogStyles.details}>
+                            <summary>登出這個 App</summary>
+                            <p className={dialogStyles.hint}>停止此 App 的 Agent、清除本機儲存的 API 金鑰，並停止此 App 管理的伺服器。</p>
+                            <button className={confirmLogout ? styles.killBtnOn : styles.killBtnOff} onClick={doLogout}><LogOut size={14} />{confirmLogout ? '確認登出並清除金鑰' : '登出並清除金鑰'}</button>
+                            {confirmLogout && <button className={dialogStyles.button} onClick={() => setConfirmLogout(false)}>取消登出</button>}
+                        </details>
+                    </ServerSettingsDialog>}
+
                 </>
             )}
         </div>

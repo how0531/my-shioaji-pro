@@ -1,15 +1,14 @@
 // src/lib/tauri.ts — desktop bridge: sidecar server management, popout
 // windows, auto-updates. Every entry point is a no-op in the browser.
 
-import type {
-    DownloadEvent,
-    Update,
-} from '@tauri-apps/plugin-updater';
+import type { DownloadEvent } from '@tauri-apps/plugin-updater';
 import {
     type ApiScheme,
     DEFAULT_PORT,
     EXPECTED_SERVER_VERSION,
     LEGACY_PORT,
+    getApiBase,
+    getDevServerPort,
     getApiPort,
     getApiScheme,
     getServerPid,
@@ -26,29 +25,142 @@ import {
     setStoredSpawnKeyHash,
     shouldForceRespawn,
 } from './spawn-keys';
+import {
+    cacheAgentHarnessEnabled,
+    resolveAgentHarnessSetting,
+} from './agent-harness-state';
+import {
+    harnessOwnershipCompatible,
+    recoverHarnessOwnership,
+} from './sidecar-ownership';
 import { notify } from './trade';
+import { FAST_START_SCHEDULE, STOP_SCHEDULE, pollDelay, pollUntil, throttled } from './poll-until';
+import { serverHealthReady } from './server-health';
+import { serverIdentityVerified, setServerIdentityVerified } from './server-identity';
+import {
+    boundPorts,
+    freePortAfterStop,
+    waitForRememberedSpawn,
+} from './startup-probes';
+
+const PROCESS_ALIVE_INTERVAL_MS = 1500;
+
+// native helpers for the start path; a missing command (older shell) or IPC
+// failure must never read as "the process died" or "the port is free"
+// one shared import for the fan-out below (14 concurrent find_free_port)
+let coreModule: Promise<typeof import('@tauri-apps/api/core')> | null = null;
+const core = () => (coreModule ??= import('@tauri-apps/api/core'));
+async function processAlive(pid: number): Promise<boolean> {
+    const { invoke } = await core();
+    return invoke<boolean>('process_alive', { pid }).catch(() => true);
+}
+async function findFreePort(preferred: number): Promise<number> {
+    const { invoke } = await core();
+    return invoke<number>('find_free_port', { preferred });
+}
+
+// when we last stopped our own server: its port may need a moment before it
+// is bindable again (replaces the fixed 1.2 s restart sleep)
+let lastOwnStopAt = 0;
+const RECENT_STOP_MS = 10_000;
+import {
+    endTiming,
+    markStage,
+    peekActiveTiming,
+    subscribeTiming,
+} from './startup-timing';
+import { cacheDesktopConfigured } from './desktop-setup-state';
+import { isChildWindow } from './window-role';
+import { newPopoutWindowId } from './flash-account';
 
 export { isTauri } from './runtime';
+export {
+    isAgentHarnessEnabled,
+    subscribeAgentHarnessEnabled,
+} from './agent-harness-state';
+export { harnessOwnershipCompatible } from './sidecar-ownership';
 
-// poll /health until it answers, then reload — used after a fresh start so
+// poll /health until the broker session is usable, then reload — used after a fresh start so
 // every panel bootstraps cleanly instead of racing a server that's still
-// warming up (login + CA activation + contract load)
-export function reloadWhenHealthy(timeoutMs = 90_000) {
-    const deadline = Date.now() + timeoutMs;
-    const t = setInterval(async () => {
-        if (Date.now() > deadline) {
-            clearInterval(t);
-            return;
-        }
+// warming up (login + CA activation + contract load). The first check runs
+// immediately: by the time serverStart returns, /info already answered, so
+// the old 2 s head start was pure dead time (issue #142).
+//
+// Only one wait at a time: a newer call, or a new timing run (the user
+// clicked restart/stop/switch meanwhile), cancels this one — its timeout
+// must neither close the newer run nor reload the page under it.
+let healthWait: AbortController | null = null;
+// Resolves true when it triggered the reload, false when it timed out or
+// was cancelled.
+export function reloadWhenHealthy(
+    timeoutMs = 90_000,
+    onTimeout?: () => void,
+): Promise<boolean> {
+    healthWait?.abort();
+    const wait = new AbortController();
+    healthWait = wait;
+    const runId = peekActiveTiming()?.id;
+    const off = subscribeTiming(() => {
+        const active = peekActiveTiming();
+        if (active && active.id !== runId) wait.abort();
+    });
+    markStage('wait-health', undefined, { runId });
+    return (async () => {
         try {
-            const { fetchHealth } = await import('./shioaji');
-            await fetchHealth();
-            clearInterval(t);
+            const res = await pollUntil(
+                async (_attempt, signal) => {
+                    const { fetchHealth } = await import('./shioaji');
+                    const health = await fetchHealth({ signal });
+                    return serverHealthReady(health) ? true : undefined;
+                },
+                { timeoutMs, attemptTimeoutMs: 5000, signal: wait.signal },
+            );
+            if (res.cancelled) return false;
+            if (res.timedOut) {
+                endTiming('failed', `health not ok after ${res.attempts} polls`, {
+                    runId,
+                });
+                onTimeout?.();
+                return false;
+            }
+            markStage('healthy', `polls=${res.attempts}`, { runId });
+            markStage('reload', undefined, { runId });
+            markTrayReadyOnReload();
             window.location.reload();
-        } catch {
-            // not up yet
+            return true;
+        } finally {
+            off();
+            if (healthWait === wait) healthWait = null;
         }
-    }, 2000);
+    })();
+}
+
+const TRAY_READY_KEY = 'shioaji:tray-ready-after-reload';
+
+export function markTrayReadyOnReload(): void {
+    if (!isTauri || isChildWindow()) return;
+    try { sessionStorage.setItem(TRAY_READY_KEY, '1'); } catch { /* storage may be unavailable */ }
+}
+
+export function consumeTrayReadyOnReload(): boolean {
+    if (!isTauri || isChildWindow()) return false;
+    try {
+        const ready = sessionStorage.getItem(TRAY_READY_KEY) === '1';
+        sessionStorage.removeItem(TRAY_READY_KEY);
+        return ready;
+    } catch { return false; }
+}
+
+export type TrayStatus = 'idle' | 'cold' | 'boot' | 'ready' | 'conn' | 'think' | 'order' | 'filled' | 'error';
+
+export function setTrayStatus(status: TrayStatus): void {
+    if (!isTauri || isChildWindow()) return;
+    void import('@tauri-apps/api/core').then(({ invoke }) =>
+        invoke('set_tray_status', {
+            status,
+            reduceMotion: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+        }),
+    ).catch(() => undefined);
 }
 
 // ---- shioaji server sidecar ----
@@ -61,6 +173,7 @@ export interface ServerStatus {
     simulation?: boolean;
     version?: string;
     scheme?: ApiScheme;
+    agentHarnessEnabled?: boolean;
 }
 
 export interface SidecarResult {
@@ -103,15 +216,19 @@ async function spawnServer(
     env: Record<string, string>,
     port: number,
     scheme: ApiScheme = 'http',
+    agentHarnessEnabled = true,
 ): Promise<SidecarResult> {
     const fullEnv = { NO_COLOR: '1', ...env };
     const { invoke } = await import('@tauri-apps/api/core');
+    markStage('spawn', `port=${port} ${args.includes('--production') ? 'prod' : 'sim'}`);
     let pid: number;
     try {
+        setTrayStatus('boot');
         pid = await invoke<number>('spawn_server', {
             args,
             env: fullEnv,
             port,
+            agentHarnessEnabled,
         });
     } catch (e) {
         if (/not found|unknown/i.test(String(e))) {
@@ -122,24 +239,140 @@ async function spawnServer(
     }
     setServerPid(pid);
     setSpawnPort(port);
-    const deadline = Date.now() + 45_000;
-    while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 1500));
-        if (await probeInfo(port, scheme)) {
-            return { ok: true, output: await readServerLog(port) };
-        }
-        const alive = await invoke<boolean>('process_alive', { pid }).catch(
-            () => true, // transient IPC failure must not read as "died"
-        );
-        if (!alive) {
-            setServerPid(null);
-            return { ok: false, output: await readServerLog(port) };
-        }
+    // the listener binds only after login + contract load; probe at once,
+    // then quickly, backing off to 1 s (was: first probe after 1.5 s, then
+    // every 1.5 s)
+    markStage('wait-listener');
+    // /info on the fast schedule; process_alive (PowerShell per call on
+    // Windows) no more often than the old 1.5 s loop did
+    const alive = throttled(
+        () =>
+            invoke<boolean>('process_alive', { pid }).catch(
+                () => true, // transient IPC failure must not read as "died"
+            ),
+        PROCESS_ALIVE_INTERVAL_MS,
+        true,
+    );
+    const waited = await pollUntil<'up' | 'died'>(
+        async () => {
+            if (await probeInfo(port, scheme)) return 'up';
+            return (await alive()) ? undefined : 'died';
+        },
+        { timeoutMs: 45_000 },
+    );
+    if (waited.value === 'up') {
+        markStage('listener-up', `polls=${waited.attempts}`);
+        // The listener already answered. Reading the startup log through
+        // plugin-fs can take seconds and held back the first health check.
+        // Only production needs that log here to surface CA activation
+        // failures; simulation has no CA to validate.
+        return { ok: true, output: args.includes('--production') ? await readServerLog(port) : '' };
+    }
+    if (waited.value === 'died') {
+        setServerPid(null);
+        return { ok: false, output: await readServerLog(port) };
     }
     return {
         ok: false,
         output: `${await readServerLog(port)}\n啟動逾時（45 秒未就緒）`.trim(),
     };
+}
+
+export async function nativeOwnsHarnessSidecar(port: number): Promise<boolean> {
+    try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        return await invoke<boolean>('agent_harness_sidecar_owned', { port });
+    } catch {
+        return false;
+    }
+}
+
+// Agent Harness ownership recovery — after a crash/force-quit the next app
+// launch ADOPTS the healthy orphan sidecar (good for plain trading), but the
+// harness signing boundary is process-local, so every harness entry point
+// dead-ends with 「需要目前 App instance 自己啟動的…」 until the server is
+// respawned by THIS process. Restart through serverStart: its harnessMismatch
+// branch stops the unowned daemon only with full is-shioaji ownership proof
+// (foreign servers are refused, fail-closed) and spawns fresh natively.
+// Single-flight so a settings toggle and an agent start racing each other
+// (or a boot-time restore) never stack concurrent respawns.
+let harnessRecoveryInFlight: Promise<StartResult | null> | null = null;
+let harnessRecoveryReloaded = false;
+let harnessFailureWatch: object | null = null;
+function reloadIfConfiguredServerHealthy(): void {
+    if (harnessFailureWatch || isChildWindow()) return;
+    const watch = {};
+    harnessFailureWatch = watch;
+    const runId = peekActiveTiming()?.id;
+    const off = subscribeTiming(() => {
+        const active = peekActiveTiming();
+        if (active && active.id !== runId) {
+            if (harnessFailureWatch === watch) harnessFailureWatch = null;
+            off();
+        }
+    });
+    let attempt = 0;
+    const check = async () => {
+        if (harnessFailureWatch !== watch) return;
+        if (serverIdentityVerified()) {
+            harnessFailureWatch = null;
+            off();
+            return;
+        }
+        try {
+            const settings = await loadDesktopSettings();
+            const status = await serverStatus(async (candidate) => {
+                if (!candidate.healthy || candidate.simulation !== !settings.production) return false;
+                if (EXPECTED_SERVER_VERSION && candidate.version && candidate.version !== EXPECTED_SERVER_VERSION) return false;
+                const scheme = candidate.scheme ?? 'http';
+                if (settings.httpsEnabled
+                    ? scheme !== 'https' && await localTlsCertExists()
+                    : scheme !== 'http') return false;
+                if (!harnessOwnershipCompatible(settings.agentHarnessEnabled,
+                    !!candidate.port && await nativeOwnsHarnessSidecar(candidate.port))) return false;
+                return !settings.production || !settings.caPath ||
+                    (!!candidate.port && await caActive(candidate.port, scheme));
+            });
+            if (harnessFailureWatch !== watch || !status?.running) return;
+            harnessFailureWatch = null;
+            off();
+            if (status.port) setApiPort(status.port);
+            if (status.scheme) setApiScheme(status.scheme);
+            window.location.reload(); // boot verifies again before lifting the gate
+        } catch {
+            // Keep the mutation gate closed when identity cannot be proven.
+        } finally {
+            if (harnessFailureWatch === watch) {
+                window.setTimeout(check, pollDelay(++attempt, FAST_START_SCHEDULE));
+            }
+        }
+    };
+    void check();
+}
+export function ensureHarnessOwnedServer(opts: { deferReload?: boolean } = {}): Promise<StartResult | null> {
+    if (!harnessRecoveryInFlight) {
+        harnessRecoveryInFlight = recoverHarnessOwnership({
+            nativeOwned: () => nativeOwnsHarnessSidecar(getApiPort()),
+            loadSettings: loadDesktopSettings,
+            restart: async () => {
+                setServerIdentityVerified(false);
+                const settings = await loadDesktopSettings();
+                return serverStart({ ...settings, agentHarnessEnabled: true });
+            },
+        }).finally(() => {
+            harnessRecoveryInFlight = null;
+        });
+    }
+    return harnessRecoveryInFlight.then((res) => {
+        if (res && !opts.deferReload && !harnessRecoveryReloaded) {
+            harnessRecoveryReloaded = true;
+            void reloadWhenHealthy(90_000, reloadIfConfiguredServerHealthy);
+        }
+        return res;
+    }).catch((error) => {
+        if (!serverIdentityVerified()) void reloadIfConfiguredServerHealthy();
+        throw error;
+    });
 }
 
 // startup/login output lands in ~/.shioaji/sjpro-server-<port>.log now —
@@ -187,34 +420,31 @@ async function spawnServerViaChannels(
     } catch (e) {
         return { ok: false, output: `啟動失敗：${String(e)}` };
     }
-    // remember the child pid — a foreground `server start` never registers
-    // with the CLI daemon state, so stop/restart (even after an app relaunch)
-    // must kill this pid ourselves. Also hand it to the Rust side, which
-    // reaps the child on app exit (a parentless server zombifies: socket
-    // bound, HTTP dead — and squats the port for the next launch).
+    // Remember the child pid for legacy stop/restart behavior. This fallback
+    // intentionally cannot register a trusted harness sidecar: renderer-owned
+    // PID/port input must never establish the native signing boundary.
     if (child?.pid) {
         setServerPid(child.pid);
         setSpawnPort(port);
-        try {
-            const { invoke } = await import('@tauri-apps/api/core');
-            await invoke('register_server_pid', { pid: child.pid });
-        } catch {
-            // older shell without the command — exit reaping unavailable
-        }
     }
     // poll until the server answers, or it dies, or we give up (~45s covers a
     // production login + CA activation + contract load)
-    const deadline = Date.now() + 45_000;
-    while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 1500));
-        if (await probeInfo(port, scheme)) {
-            return { ok: true, output: buf.replace(ANSI_RE, '').trim() };
-        }
-        if (exitCode !== null && exitCode !== 0) {
+    markStage('wait-listener', 'legacy spawn');
+    const waited = await pollUntil<'up' | 'died'>(
+        async () => {
+            if (await probeInfo(port, scheme)) return 'up';
             // process exited before serving — a real start failure
-            setServerPid(null);
-            return { ok: false, output: buf.replace(ANSI_RE, '').trim() };
-        }
+            return exitCode !== null && exitCode !== 0 ? 'died' : undefined;
+        },
+        { timeoutMs: 45_000 },
+    );
+    if (waited.value === 'up') {
+        markStage('listener-up', `polls=${waited.attempts}`);
+        return { ok: true, output: buf.replace(ANSI_RE, '').trim() };
+    }
+    if (waited.value === 'died') {
+        setServerPid(null);
+        return { ok: false, output: buf.replace(ANSI_RE, '').trim() };
     }
     return {
         ok: false,
@@ -226,6 +456,7 @@ async function spawnServerViaChannels(
 // Ports a shioaji server could be answering on: whatever the app last used,
 // the app default, and the CLI default (a user-run `shioaji server` daemon).
 function candidatePorts(): number[] {
+    if (getDevServerPort()) return [getDevServerPort()!];
     return [...new Set([getApiPort(), DEFAULT_PORT, LEGACY_PORT])];
 }
 
@@ -360,20 +591,27 @@ export async function ensureLocalTlsCert(): Promise<SidecarResult> {
 // its state file goes stale. Ground truth is therefore an HTTP probe of the
 // candidate ports; the CLI registry is only consulted as a last resort for
 // daemons living on some other port.
-export async function serverStatus(): Promise<ServerStatus | null> {
+export async function serverStatus(
+    accept?: (status: ServerStatus) => Promise<boolean>,
+): Promise<ServerStatus | null> {
     if (!isTauri) return null;
     const ports = candidatePorts();
-    const infos = await Promise.all(ports.map((p) => probeInfoEither(p)));
+    // probe all candidates at once but decide in order, returning as soon as
+    // the first-in-order hit is known: when the App's own port answers
+    // (every post-start reload), don't also wait for the refused http+https
+    // probes of 8080 (issue #142: boot probe 2.2–2.5 s natively)
+    const pending = ports.map((p) => probeInfoEither(p));
     for (const [i, port] of ports.entries()) {
-        const hit = infos[i];
+        const hit = await pending[i];
         if (!hit) continue;
-        return {
+        const status: ServerStatus = {
             running: true,
             port,
             healthy: await probeHealthy(port, hit.scheme),
             simulation: hit.info.simulation,
             version: hit.info.version,
             scheme: hit.scheme,
+            agentHarnessEnabled: hit.info.agentHarnessEnabled,
             // only claim a pid for the server we spawned — an attached
             // external server has an unknown pid, and showing our stale
             // record for it is misleading
@@ -382,7 +620,9 @@ export async function serverStatus(): Promise<ServerStatus | null> {
                     ? (getServerPid() ?? undefined)
                     : undefined,
         };
+        if (!accept || await accept(status)) return status;
     }
+    if (getDevServerPort()) return { running: false };
     try {
         const res = await sidecar(['server', 'status', '--format', 'json']);
         const jsonStart = res.output.indexOf('{');
@@ -393,15 +633,17 @@ export async function serverStatus(): Promise<ServerStatus | null> {
             if (st.running && st.port && !ports.includes(st.port)) {
                 const hit = await probeInfoEither(st.port);
                 if (hit) {
-                    return {
+                    const status: ServerStatus = {
                         running: true,
                         port: st.port,
                         healthy: await probeHealthy(st.port, hit.scheme),
                         simulation: hit.info.simulation,
                         version: hit.info.version,
                         scheme: hit.scheme,
+                        agentHarnessEnabled: hit.info.agentHarnessEnabled,
                         pid: st.pid,
                     };
+                    if (!accept || await accept(status)) return status;
                 }
             }
         }
@@ -411,29 +653,46 @@ export async function serverStatus(): Promise<ServerStatus | null> {
     return { running: false };
 }
 
-// all probes go through plugin-http; its reqwest is built with
-// rustls-tls-native-roots so 本機 HTTPS (mkcert, trust chain in the OS
-// keychain/cert store) validates the same way the webview does. If the
-// Rust side still rejects the certificate (e.g. a CA that only lives in
-// the login keychain), fall back to the webview's own fetch, which uses
-// the OS networking stack.
+// Plaintext localhost probes use the webview first; HTTPS and fallbacks use
+// plugin-http with rustls-tls-native-roots. If Rust rejects a cert trusted
+// only by the login keychain, fall back to the webview's OS networking stack.
 async function probeFetch(
     url: string,
     timeoutMs: number,
 ): Promise<Response> {
-    const { fetch: tauriFetch } = await import('@tauri-apps/plugin-http');
+    // The webview already reaches the local HTTP API for every panel. At
+    // startup the plugin-http queue can take several seconds to answer even
+    // while that API is healthy, delaying (or falsely failing) /info and
+    // /health. Use the same fast path as the panels for plaintext localhost;
+    // retain the native client for a CLI with restrictive CORS or HTTPS.
+    if (url.startsWith('http://127.0.0.1:')) {
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), Math.min(timeoutMs, 1500));
+        try {
+            return await fetch(url, { signal: controller.signal });
+        } catch {
+            // Native fallback below.
+        } finally {
+            window.clearTimeout(timer);
+        }
+    }
     try {
-        return await tauriFetch(url, {
-            signal: AbortSignal.timeout(timeoutMs),
-        });
+        return await tauriFetchWithTimeout(url, timeoutMs);
     } catch (err) {
         if (url.startsWith('https://')) {
+            const controller = new AbortController();
+            const timer = window.setTimeout(
+                () => controller.abort(),
+                timeoutMs,
+            );
             try {
                 return await fetch(url, {
-                    signal: AbortSignal.timeout(timeoutMs),
+                    signal: controller.signal,
                 });
             } catch (err2) {
                 throw err2;
+            } finally {
+                window.clearTimeout(timer);
             }
         }
         throw err;
@@ -444,7 +703,11 @@ async function probeFetch(
 async function probeInfo(
     port: number,
     scheme: ApiScheme = getApiScheme(),
-): Promise<{ version: string; simulation: boolean } | null> {
+): Promise<{
+    version: string;
+    simulation: boolean;
+    agentHarnessEnabled: boolean;
+} | null> {
     try {
         // generous timeout: at boot the plugin-http queue is congested and
         // a tight 1.5s deadline cancelled probes against LIVE servers —
@@ -458,12 +721,17 @@ async function probeInfo(
         const info = (await res.json()) as {
             version?: string;
             simulation?: boolean;
+            agent_harness?: { enabled?: boolean };
         };
         if (
             typeof info.version === 'string' &&
             typeof info.simulation === 'boolean'
         ) {
-            return { version: info.version, simulation: info.simulation };
+            return {
+                version: info.version,
+                simulation: info.simulation,
+                agentHarnessEnabled: info.agent_harness?.enabled === true,
+            };
         }
     } catch {
         // not answering
@@ -478,7 +746,11 @@ async function probeInfoEither(
     port: number,
     preferred: ApiScheme = getApiScheme(),
 ): Promise<{
-    info: { version: string; simulation: boolean };
+    info: {
+        version: string;
+        simulation: boolean;
+        agentHarnessEnabled: boolean;
+    };
     scheme: ApiScheme;
 } | null> {
     const other: ApiScheme = preferred === 'https' ? 'http' : 'https';
@@ -499,12 +771,11 @@ async function probeHealthy(
             5000,
         );
         if (!res.ok) return false;
-        // the server answers 200 even when its upstream session is dead
-        // (status "unhealthy", token expired — Shioaji#215); trust the body.
-        // "degraded" (token renewal due) still counts as healthy — it's a
-        // transient state, and restarting on it would cause churn.
-        const body = (await res.json()) as { status?: string };
-        return body.status !== 'unhealthy';
+        // The server can answer 200 while its upstream session is dead or
+        // recovering; the body decides readiness. "degraded" (token renewal
+        // due) remains usable and must not cause restart churn.
+        const body = (await res.json()) as { status?: string; session_recovering?: boolean };
+        return serverHealthReady(body);
     } catch {
         return false;
     }
@@ -513,7 +784,7 @@ async function probeHealthy(
 // is CA active on this daemon? production orders 400 without it. We only
 // attach to / keep a daemon for production if its CA is live — otherwise the
 // user sets CA in the app but the running daemon never had it (issue #1).
-async function caActive(
+export async function caActive(
     port: number,
     scheme: ApiScheme = getApiScheme(),
 ): Promise<boolean> {
@@ -538,6 +809,23 @@ async function caActive(
     }
 }
 
+// AbortSignal.timeout() cannot be cancelled after a request settles. With the
+// Tauri HTTP plugin, its later abort event attempts to close an already-freed
+// Rust resource and surfaces as an unhandled "resource id ... is invalid"
+// rejection. Own the timer so successful probes clear it immediately.
+// one shared import for the probe fan-outs (serverStatus, orphan sweep)
+let httpModule: Promise<typeof import('@tauri-apps/plugin-http')> | null = null;
+async function tauriFetchWithTimeout(url: string, timeoutMs: number) {
+    const { fetch: tauriFetch } = await (httpModule ??= import('@tauri-apps/plugin-http'));
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await tauriFetch(url, { signal: controller.signal });
+    } finally {
+        window.clearTimeout(timer);
+    }
+}
+
 export interface StartResult extends SidecarResult {
     port: number;
     attached: boolean; // an existing shioaji server was reused
@@ -545,12 +833,16 @@ export interface StartResult extends SidecarResult {
 }
 
 export async function serverStart(opts: {
+    // boot already probed the servers a moment ago: reuse that result
+    // instead of a second identical round of probes (cold start)
+    knownStatus?: ServerStatus | null;
     apiKey: string;
     secretKey: string;
     production: boolean;
     caPath?: string;
     caPasswd?: string;
     httpsEnabled?: boolean;
+    agentHarnessEnabled?: boolean;
 }): Promise<StartResult> {
     // when production+CA is requested, a daemon is only good enough to reuse
     // if its CA is actually active — otherwise orders 400 (issue #1)
@@ -565,33 +857,49 @@ export async function serverStart(opts: {
     // user's own CLI daemon on :8080)? Attach only if it can actually trade
     // in the requested mode — a CA-less daemon here is exactly why
     // "加了 CA 還是 400" on the installed app.
-    let st = await serverStatus();
+    let st: ServerStatus | null;
+    if (opts.knownStatus !== undefined) {
+        st = opts.knownStatus;
+    } else {
+        markStage('probe');
+        st = await serverStatus();
+    }
     // a child we spawned may still be inside its login window: the 1.7.2
     // server binds its listener only AFTER login (~5-8s blind spot). Any
     // reload landing in that window used to see "not running", then the
     // pre-spawn reclaim killed the warming child by remembered pid — the
     // restart loop. Wait for the remembered spawn to surface instead.
-    if (!st?.running && getServerPid() && getSpawnPort()) {
+    if (!st?.running && getServerPid() && getSpawnPort() && (!getDevServerPort() || getSpawnPort() === getDevServerPort())) {
         const spawnPort = getSpawnPort()!;
-        const deadline = Date.now() + 20_000;
-        while (Date.now() < deadline) {
-            const hit = await probeInfoEither(spawnPort);
-            if (hit) {
-                st = {
-                    running: true,
-                    port: spawnPort,
-                    healthy: await probeHealthy(spawnPort, hit.scheme),
-                    simulation: hit.info.simulation,
-                    version: hit.info.version,
-                    scheme: hit.scheme,
-                    pid: getServerPid() ?? undefined,
-                };
-                break;
-            }
-            await new Promise((r) => setTimeout(r, 1500));
+        const rememberedPid = getServerPid()!;
+        // returns as soon as the warming spawn answers, or at once when the
+        // remembered process no longer exists (App relaunch); up to 20 s
+        markStage('wait-warming', `port=${spawnPort}`);
+        const warm = await waitForRememberedSpawn({
+            probe: () => probeInfoEither(spawnPort),
+            alive: () => processAlive(rememberedPid),
+        });
+        const hit = warm.kind === 'answered' ? warm.hit : null;
+        if (warm.kind === 'dead') {
+            // nothing of ours is warming: drop the stale record so the
+            // reclaim below never targets that (possibly recycled) pid
+            setServerPid(null);
         }
+        if (hit) {
+            st = {
+                running: true,
+                port: spawnPort,
+                healthy: await probeHealthy(spawnPort, hit.scheme),
+                simulation: hit.info.simulation,
+                version: hit.info.version,
+                scheme: hit.scheme,
+                agentHarnessEnabled: hit.info.agentHarnessEnabled,
+                pid: getServerPid() ?? undefined,
+            };
+        }
+        markStage('probe', `warming ${warm.kind} after ${warm.attempts} polls`);
     }
-    if (!st?.running) {
+    if (!st?.running && !getDevServerPort()) {
         // an orphan of ours can sit on a fallback port with its record lost
         // (cleared web storage) — sweep the find_free_port windows (current
         // default + the pre-21322 legacy one) before piling yet another
@@ -600,10 +908,15 @@ export async function serverStart(opts: {
             ...Array.from({ length: 9 }, (_, i) => DEFAULT_PORT + 1 + i),
             ...Array.from({ length: 5 }, (_, i) => LEGACY_PORT + 1 + i),
         ];
-        const hits = await Promise.all(win.map((p) => probeInfoEither(p)));
-        const hit = win.findIndex((_, i) => hits[i]);
+        // HTTP-probe only the ports something is actually bound to (was:
+        // two probes on each of 14 ports, ~0.9 s natively on every start)
+        markStage('sweep-orphans');
+        const bound = await boundPorts(win, findFreePort);
+        const toProbe = bound ?? win;
+        const hits = await Promise.all(toProbe.map((p) => probeInfoEither(p)));
+        const hit = toProbe.findIndex((_, i) => hits[i]);
         if (hit >= 0) {
-            const port = win[hit] as number;
+            const port = toProbe[hit] as number;
             const found = hits[hit]!;
             st = {
                 running: true,
@@ -614,6 +927,7 @@ export async function serverStart(opts: {
                 // undefined and adopts an old-version orphan
                 version: found.info.version,
                 scheme: found.scheme,
+                agentHarnessEnabled: found.info.agentHarnessEnabled,
                 pid: getServerPid() ?? undefined,
             };
         }
@@ -639,7 +953,15 @@ export async function serverStart(opts: {
             EXPECTED_SERVER_VERSION !== '' &&
             st.version !== undefined &&
             st.version !== EXPECTED_SERVER_VERSION;
-        const external = getSpawnPort() !== st.port;
+        const nativeHarnessOwned = await nativeOwnsHarnessSidecar(st.port);
+        const harnessMismatch = !harnessOwnershipCompatible(
+            opts.agentHarnessEnabled === true,
+            nativeHarnessOwned,
+        );
+        const external = getSpawnPort() !== st.port || harnessMismatch;
+        // Harness authority belongs to one native App process and one
+        // sidecar generation. Never adopt a healthy daemon from a previous
+        // App instance: it verifies a different signing key.
         // 金鑰 hash 領養檢查 (issue #16): our OWN spawn may still be logged
         // into the credentials it was STARTED with — after a re-login with a
         // different API key, adopting it shows the old account's data. Only
@@ -663,9 +985,11 @@ export async function serverStart(opts: {
             !schemeMismatch &&
             caOk &&
             !versionMismatch &&
+            !harnessMismatch &&
             !keyMismatch
         ) {
             // healthy, right mode, right version, CA live — just use it
+            markStage('attach', `port=${st.port}`);
             const schemeChanged = setApiScheme(stScheme);
             return {
                 ok: true,
@@ -694,6 +1018,8 @@ export async function serverStart(opts: {
                     ? '模式與設定不符'
                     : schemeMismatch
                       ? `連線協定不符（server ${stScheme}，需 ${wantScheme}）`
+                      : harnessMismatch
+                        ? 'Agent Harness 金鑰不屬於此 App instance'
                       : versionMismatch
                         ? `版本不符（server ${st.version}，需 ${EXPECTED_SERVER_VERSION}）`
                         : keyMismatch
@@ -715,23 +1041,38 @@ export async function serverStart(opts: {
     }
 
     // preferred port occupied by something else → first free port after it
-    let port = DEFAULT_PORT;
+    const preferredPort = getDevServerPort() ?? DEFAULT_PORT;
+    let port = preferredPort;
+    markStage('reclaim-port');
     try {
         const { invoke } = await import('@tauri-apps/api/core');
         // nothing usable is answering, so any listener still bound on our
         // ports is a zombie orphan (SIGKILLed app → dead pipe → HTTP dead) —
         // reclaim our own before picking a port; foreign listeners refuse
         // the ownership check and find_free_port dodges them below
-        for (const p of new Set([getApiPort(), DEFAULT_PORT])) {
+        for (const p of new Set(getDevServerPort() ? [preferredPort] : [getApiPort(), DEFAULT_PORT])) {
             await invoke('kill_shioaji', {
                 port: p,
                 pid: getServerPid(),
             }).catch(() => undefined);
         }
         setServerPid(null);
-        const free = await invoke<number>('find_free_port', {
-            preferred: DEFAULT_PORT,
-        });
+        // just after our own stop, give the old listener's port up to
+        // 2.5 s to free up (checked at once, so usually no wait at all);
+        // otherwise a single check as before
+        const recentlyStopped = Date.now() - lastOwnStopAt < RECENT_STOP_MS;
+        const picked = await freePortAfterStop(
+            preferredPort,
+            findFreePort,
+            recentlyStopped ? 2500 : 0,
+        );
+        const free = picked.port;
+        if (picked.attempts > 1) {
+            markStage('reclaim-port', `port freed after ${picked.elapsedMs} ms`);
+        }
+        if (getDevServerPort() && free !== preferredPort) {
+            return { ok: false, output: '隔離測試連接埠已被占用；不切換至其他伺服器', port: preferredPort, attached: false, portChanged: false };
+        }
         if (free > 0) port = free;
     } catch {
         // command unavailable — try the default and let the server error
@@ -764,7 +1105,13 @@ export async function serverStart(opts: {
     const args = ['server', 'start', '--no-open'];
     if (opts.production) args.push('--production');
     // spawn (don't await to completion) — the start runs in foreground
-    const res = await spawnServer(args, env, port, wantScheme);
+    const res = await spawnServer(
+        args,
+        env,
+        port,
+        wantScheme,
+        opts.agentHarnessEnabled,
+    );
     if (res.ok) {
         // remember which credentials THIS spawn was started with (issue #16)
         // — null (no crypto.subtle) clears the record so a stale hash never
@@ -805,24 +1152,46 @@ export async function serverStart(opts: {
     };
 }
 
-// Stop the running server. Our own spawn is killed by pid/path proof; an
-// EXTERNAL server (the user's own CLI) is only stopped when the call carries
-// explicit user intent (`allowExternal` — the 停止/重啟 buttons), via the
-// CLI's own `server stop`. Automatic flows (boot restart on mode mismatch)
-// must never take the user's server down behind their back.
+// Explicit user server changes also end idle provider processes. A completed
+// conversation can still own a running native runtime and trading authority.
+// Native stop drains pending effects, revokes grants and emits runtime_stopped.
+export async function stopAgentsForServerChange(): Promise<void> {
+    if (!isTauri) return;
+    const { invoke } = await import('@tauri-apps/api/core');
+    type Runtime = { runtimeId: string; status: string };
+    const runtimes = await invoke<Runtime[]>('agent_runtime_list');
+    for (const runtime of runtimes) {
+        if (runtime.status === 'running') {
+            await invoke<boolean>('agent_runtime_stop', { runtimeId: runtime.runtimeId });
+        }
+    }
+    const remaining = await invoke<Runtime[]>('agent_runtime_list');
+    if (remaining.some(runtime => runtime.status === 'running')) {
+        throw new Error('Agent 尚未停止，伺服器未變更。請停止正在執行的 Agent 後再試。');
+    }
+}
+
+// Stop only an App-owned server through the native ownership/lifecycle guard.
+// Never retry a native refusal through the CLI: that bypasses the lifecycle
+// lock and could stop an external server after a new Agent has started.
 export async function serverStop(opts?: {
-    allowExternal?: boolean;
+    stopAgents?: boolean; // explicit UI action only; automatic recovery must not stop agents
 }): Promise<SidecarResult> {
     if (!isTauri) return { ok: false, output: '' };
+    if (opts?.stopAgents) {
+        markStage('stop-agents');
+        try { await stopAgentsForServerChange(); }
+        catch (e) { return { ok: false, output: `無法停止 Agent：${String(e)}` }; }
+    }
     const st = await serverStatus();
     let killNote = '';
-    let killErr = '';
     const pid = getServerPid();
     // resolve the victim by port (survives lost pid records from older app
     // versions); the remembered pid is only a fallback for a server that is
     // up but not listening yet. Nothing running and no pid → nothing to kill.
     const port = (st?.running && st.port) || getApiPort();
     if (st?.running || pid) {
+        markStage('kill', `port=${port}`);
         try {
             const { invoke } = await import('@tauri-apps/api/core');
             const killed = await invoke<boolean>('kill_shioaji', {
@@ -831,37 +1200,37 @@ export async function serverStop(opts?: {
             });
             setServerPid(null);
             setSpawnPort(null);
-            if (killed) killNote = `已終止伺服器（:${port}）`;
+            if (killed) {
+                lastOwnStopAt = Date.now();
+                killNote = `已終止伺服器（:${port}）`;
+            }
         } catch (e) {
-            // ownership refused (external shioaji / foreign service) — keep
-            // the explanation; the pid record stays in case it referred to a
-            // not-yet-listening child
-            killErr = String(e);
+            // Preserve ownership records and the native explanation on refusal.
+            return { ok: false, output: String(e) };
         }
     }
-    // the CLI can stop servers it registered itself (its daemon file tracks
-    // the last `server start`, including external foreground ones on ≥1.5.5)
-    // — explicit user intent only
-    if (opts?.allowExternal) {
-        await sidecar(['server', 'stop']);
-    }
     if (st?.running && st.port) {
-        const deadline = Date.now() + 5000;
-        while (Date.now() < deadline) {
-            if (!(await probeInfo(st.port))) {
-                return {
-                    ok: true,
-                    output: killNote || `伺服器已停止（:${st.port}）`,
-                };
-            }
-            await new Promise((r) => setTimeout(r, 500));
+        // returns the moment the listener stops answering (checked at once,
+        // then 100 ms → 500 ms); up to 5 s for a server that lingers
+        const stopPort = st.port;
+        markStage('wait-exit');
+        const gone = await pollUntil(
+            async () => ((await probeInfo(stopPort)) ? undefined : true),
+            { timeoutMs: 5000, schedule: STOP_SCHEDULE },
+        );
+        if (gone.value) {
+            lastOwnStopAt = Date.now();
+            markStage('stopped', `polls=${gone.attempts}`);
+            return {
+                ok: true,
+                output: killNote || `伺服器已停止（:${st.port}）`,
+            };
         }
         return {
             ok: false,
             output: [
                 killNote,
-                killErr,
-                `:${st.port} 上的伺服器仍在運行${opts?.allowExternal ? '，請手動停止（終端機 Ctrl+C）' : ''}`,
+                `:${st.port} 上的伺服器仍在運行`,
             ]
                 .filter(Boolean)
                 .join('\n'),
@@ -880,6 +1249,7 @@ export interface DesktopSettings {
     caPath: string; // Sinopac.pfx — required for production orders
     caPasswd: string;
     httpsEnabled: boolean; // serve the sidecar over local HTTPS (mkcert)
+    agentHarnessEnabled: boolean; // runtime-toggleable; no server restart
 }
 
 const EMPTY_SETTINGS: DesktopSettings = {
@@ -890,13 +1260,54 @@ const EMPTY_SETTINGS: DesktopSettings = {
     caPath: '',
     caPasswd: '',
     httpsEnabled: false,
+    agentHarnessEnabled: true,
 };
 
-export async function loadDesktopSettings(): Promise<DesktopSettings> {
+// settings.json holds the API key, secret key and CA password: only the main
+// window may touch it. Child windows (popouts, tray) have no store permission
+// at all and learn only the non-secret "setup done" flag (desktop-setup-state).
+function assertMainWindowSettingsAccess(): void {
+    if (isChildWindow()) {
+        throw new Error('本機設定只能在主視窗讀取或修改');
+    }
+}
+
+let storeModulePromise: Promise<typeof import('@tauri-apps/plugin-store')> | null = null;
+const storeModule = () => (storeModulePromise ??= import('@tauri-apps/plugin-store'));
+
+// boot and the main-window gate both read settings at page start: share one
+// in-flight read (≈10 store IPC calls) instead of doing it twice. Only the
+// pending promise is shared — a later call always reads fresh values.
+let settingsRead: Promise<DesktopSettings> | null = null;
+export function loadDesktopSettings(): Promise<DesktopSettings> {
+    if (!settingsRead) {
+        settingsRead = readDesktopSettings().finally(() => {
+            settingsRead = null;
+        });
+    }
+    return settingsRead;
+}
+
+async function readDesktopSettings(): Promise<DesktopSettings> {
     if (!isTauri) return { ...EMPTY_SETTINGS };
-    const { LazyStore } = await import('@tauri-apps/plugin-store');
+    assertMainWindowSettingsAccess();
+    const { LazyStore } = await storeModule();
     const store = new LazyStore('settings.json');
-    return {
+    const safeDefaultMigrated =
+        (await store.get<boolean>('agentHarnessSafeDefaultV1')) ?? false;
+    const storedAgentHarnessEnabled = await store.get<boolean>(
+        'agentHarnessEnabled',
+    );
+    const agentHarnessEnabled = resolveAgentHarnessSetting(
+        storedAgentHarnessEnabled,
+        safeDefaultMigrated,
+    );
+    if (!safeDefaultMigrated) {
+        await store.set('agentHarnessEnabled', agentHarnessEnabled);
+        await store.set('agentHarnessSafeDefaultV1', true);
+        await store.save();
+    }
+    const settings = {
         apiKey: (await store.get<string>('apiKey')) ?? '',
         secretKey: (await store.get<string>('secretKey')) ?? '',
         production: (await store.get<boolean>('production')) ?? false,
@@ -904,12 +1315,18 @@ export async function loadDesktopSettings(): Promise<DesktopSettings> {
         caPath: (await store.get<string>('caPath')) ?? '',
         caPasswd: (await store.get<string>('caPasswd')) ?? '',
         httpsEnabled: (await store.get<boolean>('httpsEnabled')) ?? false,
+        agentHarnessEnabled,
     };
+    cacheAgentHarnessEnabled(settings.agentHarnessEnabled);
+    cacheDesktopConfigured(Boolean(settings.apiKey && settings.secretKey));
+    return settings;
 }
 
 export async function saveDesktopSettings(s: DesktopSettings) {
     if (!isTauri) return;
-    const { LazyStore } = await import('@tauri-apps/plugin-store');
+    assertMainWindowSettingsAccess();
+    settingsRead = null; // a read already in flight must not be shared after a save
+    const { LazyStore } = await storeModule();
     const store = new LazyStore('settings.json');
     await store.set('apiKey', s.apiKey);
     await store.set('secretKey', s.secretKey);
@@ -918,7 +1335,46 @@ export async function saveDesktopSettings(s: DesktopSettings) {
     await store.set('caPath', s.caPath);
     await store.set('caPasswd', s.caPasswd);
     await store.set('httpsEnabled', s.httpsEnabled);
+    await store.set('agentHarnessEnabled', s.agentHarnessEnabled);
+    cacheAgentHarnessEnabled(s.agentHarnessEnabled);
     await store.save();
+    cacheDesktopConfigured(Boolean(s.apiKey && s.secretKey));
+}
+
+export interface SetAgentHarnessResult {
+    // ownership recovery respawned the sidecar (adopted orphan → owned)
+    restarted: boolean;
+    // the API base moved with the respawn — caller should reload the page
+    portChanged: boolean;
+}
+
+export async function setAgentHarnessEnabled(
+    enabled: boolean,
+): Promise<SetAgentHarnessResult> {
+    if (!isTauri) throw new Error('Agent Harness 只能由 Desktop native host 切換');
+    // Enabling against an ADOPTED sidecar (crash/force-quit orphan) used to
+    // dead-end on the native ownership check with no way out of the settings
+    // dialog — recover by respawning natively first. Disable is left as-is:
+    // an unowned sidecar cannot be signed for either way, and the existing
+    // error already points at the server restart.
+    const recovered = enabled ? await ensureHarnessOwnedServer({ deferReload: true }) : null;
+    try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        await invoke('agent_harness_set_enabled', {
+            origin: new URL(getApiBase()).origin,
+            enabled,
+        });
+        const settings = await loadDesktopSettings();
+        await saveDesktopSettings({ ...settings, agentHarnessEnabled: enabled });
+    } catch (error) {
+        if (recovered) void reloadIfConfiguredServerHealthy();
+        throw error;
+    }
+    if (recovered) void reloadWhenHealthy(90_000, reloadIfConfiguredServerHealthy);
+    return {
+        restarted: recovered !== null,
+        portChanged: recovered?.portChanged ?? false,
+    };
 }
 
 // native file picker for the Sinopac.pfx certificate
@@ -962,67 +1418,129 @@ function parseEnvKeys(
     return out;
 }
 
-// lets the user pick a project FOLDER (not the .env file itself) and pulls
-// SJ_API_KEY/SJ_SEC_KEY out of the first matching file found inside it.
-// Native open-file dialogs hide dotfiles by default (macOS/Windows/Linux
-// file pickers all do this — there's no cross-platform API flag to force
-// them visible, only an undiscoverable OS-level shortcut on macOS), so
-// ".env" itself is invisible if picked directly. A directory listing via
-// the fs plugin isn't subject to that UI-level filtering, so picking the
-// containing folder and reading its entries sidesteps the problem entirely.
-export async function pickEnvFile(): Promise<{
-    apiKey?: string;
-    secretKey?: string;
-    error?: string;
-} | null> {
+export type EnvSelection = { directory: string; candidates: string[] };
+export type EnvImportResult =
+    | { kind: 'imported'; fileName: string; apiKey?: string; secretKey?: string }
+    | { kind: 'choose'; selection: EnvSelection }
+    | { kind: 'error'; error: string };
+
+const envFileName = (name: string) => name.endsWith('.env') || name.startsWith('.env.');
+const fileNameFromPath = (path: string) =>
+    path.split(path.startsWith('/') ? '/' : /[/\\]/).pop() ?? path;
+const joinEnvPath = (directory: string, name: string) => {
+    const posix = directory.startsWith('/');
+    const trailingSeparator = posix ? directory.endsWith('/') : /[/\\]$/.test(directory);
+    const separator = posix ? '/' : directory.includes('\\') ? '\\' : '/';
+    return `${directory}${trailingSeparator ? '' : separator}${name}`;
+};
+const checkedFiles = (names: string[]) =>
+    `已檢查檔案：${names.length ? names.slice(0, 8).join('、') + (names.length > 8 ? ` 等 ${names.length} 個` : '') : '無'}`;
+
+export function envCandidates(names: string[]): string[] {
+    return names.filter(envFileName).sort((a, b) =>
+        a === '.env' ? -1 : b === '.env' ? 1 : a.localeCompare(b),
+    );
+}
+
+async function readEnvKeys(path: string, fileName: string): Promise<EnvImportResult> {
+    const { readTextFile } = await import('@tauri-apps/plugin-fs');
+    let text: string;
+    try {
+        text = await readTextFile(path);
+    } catch {
+        return { kind: 'error', error: `無法讀取 ${fileName}。${checkedFiles([fileName])}` };
+    }
+    const found = parseEnvKeys(text);
+    return found.apiKey || found.secretKey
+        ? { kind: 'imported', fileName, ...found }
+        : { kind: 'error', error: `${fileName} 沒有 SJ_API_KEY / SJ_SEC_KEY。${checkedFiles([fileName])}` };
+}
+
+// File dialogs can hide ".env" on some platforms; selecting its folder and
+// listing entries also lets the user import that hidden file.
+export async function pickEnvFile(mode: 'file' | 'directory'): Promise<EnvImportResult | null> {
     if (!isTauri) return null;
     const { open } = await import('@tauri-apps/plugin-dialog');
-    const dir = await open({
-        directory: true,
-        title: '選擇專案資料夾（自動尋找裡面的 .env*）',
+    const selected = await open({
+        multiple: false,
+        directory: mode === 'directory',
+        title: mode === 'file' ? '選擇 .env 檔案' : '選擇包含 .env 檔案的資料夾',
     });
-    if (typeof dir !== 'string') return null; // dialog cancelled
-    const { readDir, readTextFile } = await import('@tauri-apps/plugin-fs');
-    const entries = await readDir(dir).catch(() => []);
-    // any file starting with ".env" — .env, .env.local, .env.production,
-    // .env.whatever-custom-name a project happens to use. Exact ".env"
-    // first (most common), then the rest alphabetically for determinism.
-    const candidates = entries
-        .filter((e) => e.isFile && e.name.startsWith('.env'))
-        .map((e) => e.name)
-        .sort((a, b) => (a === '.env' ? -1 : b === '.env' ? 1 : a.localeCompare(b)));
-    for (const candidate of candidates) {
-        const text = await readTextFile(`${dir}/${candidate}`).catch(
-            () => '',
-        );
-        const found = parseEnvKeys(text);
-        if (found.apiKey || found.secretKey) return found;
+    if (typeof selected !== 'string') return null;
+    if (mode === 'file') {
+        const fileName = fileNameFromPath(selected);
+        return envFileName(fileName)
+            ? readEnvKeys(selected, fileName)
+            : { kind: 'error', error: `${fileName} 不是 .env 檔案。${checkedFiles([fileName])}` };
     }
-    return {
-        error:
-            candidates.length > 0
-                ? `找到 ${candidates.join('、')} 但裡面沒有 SJ_API_KEY / SJ_SEC_KEY`
-                : '這個資料夾裡沒有任何 .env 開頭的檔案',
-    };
+    const { readDir } = await import('@tauri-apps/plugin-fs');
+    let names: string[];
+    try {
+        names = (await readDir(selected)).filter(entry => entry.isFile).map(entry => entry.name);
+    } catch {
+        return { kind: 'error', error: `無法讀取資料夾。${checkedFiles([])}` };
+    }
+    const candidates = envCandidates(names);
+    if (!candidates.length) {
+        return { kind: 'error', error: `資料夾裡沒有 .env 檔案。${checkedFiles(names.sort())}` };
+    }
+    if (candidates.length === 1) return readEnvKeys(joinEnvPath(selected, candidates[0]!), candidates[0]!);
+    return { kind: 'choose', selection: { directory: selected, candidates } };
+}
+
+export async function importEnvCandidate(selection: EnvSelection, fileName: string): Promise<EnvImportResult> {
+    if (!selection.candidates.includes(fileName)) {
+        return { kind: 'error', error: `檔案不在候選清單中。${checkedFiles(selection.candidates)}` };
+    }
+    return readEnvKeys(joinEnvPath(selection.directory, fileName), fileName);
 }
 
 // ---- popout windows ----
 
 let popoutCounter = 0;
 
-export async function openPopout(type: string, code: string | null) {
-    const qs = new URLSearchParams({ popout: type, code: code ?? '' });
+export async function openPopout(
+    type: string,
+    code: string | null,
+    // 面板設定帶進彈出視窗當初始值（例：session = 圖表時段選擇）
+    extra: Record<string, string> = {},
+    onCreated?: () => void,
+) {
+    const qs = new URLSearchParams({ popout: type, code: code ?? '', ...extra });
     if (!isTauri) {
-        window.open(
-            `${window.location.pathname}?${qs}`,
-            `sj-popout-${type}-${code ?? 'x'}`,
+        const name = `sj-popout-${type}-${code ?? 'x'}${extra.win ? `-${extra.win}` : ''}`;
+        if (!onCreated) {
+            window.open(`${window.location.pathname}?${qs}`, name, 'width=900,height=620,menubar=no,toolbar=no');
+            return;
+        }
+        const opened = window.open(
+            '',
+            // a flash popout carries its own window id (#139) — name the
+            // browser window by it so a second popout of the same code opens
+            // beside the first instead of replacing it
+            name,
             'width=900,height=620,menubar=no,toolbar=no',
         );
+        if (opened?.location.href === 'about:blank') {
+            onCreated?.();
+            opened.location.replace(`${window.location.pathname}?${qs}`);
+        } else {
+            opened?.focus();
+        }
         return;
     }
     const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
-    popoutCounter += 1;
-    new WebviewWindow(`popout-${type}-${popoutCounter}`, {
+    const label = type === 'flash' && extra.win
+        ? `popout-flash-${extra.win}`
+        : `popout-${type}-${++popoutCounter}`;
+    const existing = await WebviewWindow.getByLabel(label);
+    if (existing) {
+        await existing.show();
+        await existing.setFocus();
+        return;
+    }
+    onCreated?.();
+    new WebviewWindow(label, {
         url: `index.html?${qs}`,
         // Tauri's drag-drop interception eats in-page HTML5 drag on
         // WKWebView (watchlist reorder) — no file-drop feature needs it
@@ -1037,6 +1555,8 @@ export async function openPopout(type: string, code: string | null) {
 
 // 閃電全開: pop a flash-order window per code, arranged by the chosen
 // layout — full-screen grids, a right-side column, or a bottom row.
+// The caller supplies each tile's window id and pinned account. A tile source
+// can reuse its id so reopening it keeps that window's own selection (#139).
 export interface FlashTileLayout {
     cols: number;
     rows: number;
@@ -1046,6 +1566,9 @@ export interface FlashTileLayout {
 export async function openFlashTiles(
     codes: string[],
     layout: FlashTileLayout = { cols: 3, rows: 3, region: 'full' },
+    // per-tile extra URL params (the pinned-account window id, #139)
+    tileParams: (code: string) => Record<string, string> = () => ({ win: newPopoutWindowId() }),
+    onTileCreated?: (code: string, params: Record<string, string>) => void,
 ) {
     const count = Math.min(codes.length, layout.cols * layout.rows);
     if (count === 0) return;
@@ -1072,21 +1595,36 @@ export async function openFlashTiles(
     if (!isTauri) {
         use.forEach((code, i) => {
             const { x, y } = posOf(i);
-            const qs = new URLSearchParams({ popout: 'flash', code });
-            window.open(
-                `${window.location.pathname}?${qs}`,
+            const extra = tileParams(code);
+            const qs = new URLSearchParams({ popout: 'flash', code, ...extra });
+            const opened = window.open(
+                '',
                 `sj-flash-tile-${code}`,
                 `left=${x},top=${y},width=${w},height=${h},menubar=no,toolbar=no`,
             );
+            if (opened?.location.href === 'about:blank') {
+                onTileCreated?.(code, extra);
+                opened.location.replace(`${window.location.pathname}?${qs}`);
+            } else {
+                opened?.focus();
+            }
         });
         return;
     }
     const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
-    use.forEach((code, i) => {
+    for (const [i, code] of use.entries()) {
         const { x, y } = posOf(i);
-        const qs = new URLSearchParams({ popout: 'flash', code });
-        popoutCounter += 1;
-        new WebviewWindow(`popout-flashtile-${popoutCounter}`, {
+        const extra = tileParams(code);
+        const qs = new URLSearchParams({ popout: 'flash', code, ...extra });
+        const label = extra.win ? `popout-flashtile-${extra.win}` : `popout-flashtile-${++popoutCounter}`;
+        const existing = await WebviewWindow.getByLabel(label);
+        if (existing) {
+            await existing.show();
+            await existing.setFocus();
+            continue;
+        }
+        onTileCreated?.(code, extra);
+        new WebviewWindow(label, {
             url: `index.html?${qs}`,
             dragDropEnabled: false,
             title: `⚡ ${code}`,
@@ -1099,26 +1637,17 @@ export async function openFlashTiles(
             minWidth: 210,
             minHeight: 280,
         });
-    });
+    }
 }
 
 // ---- app version (for support: shown in the server panel & debug) ----
 
-let cachedVersion: string | null = null;
-
 export async function appVersion(): Promise<string> {
-    if (cachedVersion) return cachedVersion;
-    if (isTauri) {
-        try {
-            const { getVersion } = await import('@tauri-apps/api/app');
-            cachedVersion = await getVersion();
-            return cachedVersion;
-        } catch {
-            // fall through
-        }
-    }
-    cachedVersion = 'dev';
-    return cachedVersion;
+    // Only the public release tag defines a published App version. Native
+    // getVersion() also returns the schema placeholder in local/debug builds.
+    return typeof __SHIOAJI_BUILD_VERSION__ === 'string'
+        ? __SHIOAJI_BUILD_VERSION__
+        : 'dev · unknown';
 }
 
 // ---- auto-update ----
@@ -1146,7 +1675,9 @@ const APP_RELEASE_URL =
 
 let appUpdateState: AppUpdateState = { phase: 'idle' };
 const appUpdateListeners = new Set<() => void>();
-let pendingUpdate: Update | null = null;
+// The App downloads and installs updates itself, so it can stop the local
+// server and Agents before the installer runs. Only the version is kept here.
+let pendingUpdate: string | null = null;
 let updateInFlight = false;
 
 export function getAppUpdateState(): AppUpdateState {
@@ -1187,6 +1718,18 @@ function updateDownloadProgress(event: DownloadEvent) {
 
 export async function checkForUpdates(silent: boolean) {
     if (!isTauri || updateInFlight) return;
+    // dev build（vite dev / target/debug）不檢查更新 — 否則 dev 環境會
+    // 下載正式版並在重啟時把 debug app 換掉
+    if (import.meta.env.DEV) {
+        if (!silent) {
+            notify({
+                kind: 'info',
+                title: 'Dev build 不檢查更新',
+                body: '開發模式跳過自動更新，避免被正式版取代',
+            });
+        }
+        return;
+    }
     if (appUpdateState.phase === 'ready') {
         if (!silent) {
             notify({
@@ -1224,7 +1767,7 @@ export async function checkForUpdates(silent: boolean) {
             return;
         }
         setAppUpdateState({ phase: 'available', version: update.version });
-        const { invoke } = await import('@tauri-apps/api/core');
+        const { Channel, invoke } = await import('@tauri-apps/api/core');
         const canInstall = await invoke<boolean>(
             'supports_in_app_update',
         ).catch(() => !/Linux/i.test(navigator.userAgent));
@@ -1241,21 +1784,29 @@ export async function checkForUpdates(silent: boolean) {
             });
             return;
         }
-        pendingUpdate = update;
+        await update.close().catch(() => undefined);
         setAppUpdateState({
             phase: 'downloading',
             version: update.version,
             downloadedBytes: 0,
         });
-        await update.download(updateDownloadProgress);
-        setAppUpdateState({ phase: 'ready', version: update.version });
+        const onEvent = new Channel<DownloadEvent>();
+        onEvent.onmessage = updateDownloadProgress;
+        const version = await invoke<string | null>('app_update_download', {
+            onEvent,
+        });
+        if (!version) {
+            setAppUpdateState({ phase: 'idle' });
+            return;
+        }
+        pendingUpdate = version;
+        setAppUpdateState({ phase: 'ready', version });
         notify({
             kind: 'info',
-            title: `更新 v${update.version} 已下載`,
+            title: `更新 v${version} 已下載`,
             body: '可在方便時重新啟動並完成更新',
         });
     } catch (e) {
-        await pendingUpdate?.close().catch(() => undefined);
         pendingUpdate = null;
         const message = e instanceof Error ? e.message : String(e);
         setAppUpdateState({ phase: 'error', error: message });
@@ -1281,20 +1832,34 @@ export async function restartAndInstallUpdate() {
         return;
     }
     updateInFlight = true;
-    const update = pendingUpdate;
-    setAppUpdateState({ phase: 'installing', version: update.version });
+    const version = pendingUpdate;
+    setAppUpdateState({ phase: 'installing', version });
     try {
-        await update.install();
+        // On Windows the App stops the local server and Agents first and
+        // refuses to install if they do not stop; on success it does not
+        // return (the installer takes over and restarts the App).
+        const { invoke } = await import('@tauri-apps/api/core');
+        await invoke('app_update_install');
         pendingUpdate = null;
         const { relaunch } = await import('@tauri-apps/plugin-process');
         await relaunch();
     } catch (e) {
-        await update.close().catch(() => undefined);
+        const failure = updateInstallFailure(e);
+        if (failure.keepDownload) {
+            // nothing was installed and the download is still there
+            setAppUpdateState({ phase: 'ready', version });
+            notify({
+                kind: 'err',
+                title: '無法開始更新',
+                body: failure.message,
+            });
+            return;
+        }
         pendingUpdate = null;
-        const message = e instanceof Error ? e.message : String(e);
+        const message = failure.message;
         setAppUpdateState({
             phase: 'error',
-            version: update.version,
+            version,
             error: message,
         });
         notify({
@@ -1307,17 +1872,39 @@ export async function restartAndInstallUpdate() {
     }
 }
 
-export async function openLatestRelease() {
+function updateInstallFailure(e: unknown): {
+    keepDownload: boolean;
+    message: string;
+} {
+    if (e && typeof e === 'object' && 'kind' in e && 'message' in e) {
+        const { kind, message } = e as { kind: unknown; message: unknown };
+        return {
+            keepDownload: kind === 'stopFailed',
+            message: String(message),
+        };
+    }
+    return {
+        keepDownload: false,
+        message: e instanceof Error ? e.message : String(e),
+    };
+}
+
+// 以系統預設瀏覽器開啟外部網址（WebView 內不導航）。
+export async function openExternalUrl(url: string, failTitle = '無法開啟連結') {
     try {
         const { open } = await import('@tauri-apps/plugin-shell');
-        await open(APP_RELEASE_URL);
+        await open(url);
     } catch (e) {
         notify({
             kind: 'err',
-            title: '無法開啟下載頁',
+            title: failTitle,
             body: e instanceof Error ? e.message : String(e),
         });
     }
+}
+
+export async function openLatestRelease() {
+    await openExternalUrl(APP_RELEASE_URL, '無法開啟下載頁');
 }
 
 // ---- tray events ----

@@ -1,0 +1,542 @@
+// src/lib/execution/model.ts — execution-location-independent order
+// program model (#201). One model expresses a price trigger (1 level with a
+// touch entry), a bracket (1 level: entry + OCO touch exits) and a cycling
+// grid (N levels with limit entries and take-profit exits). The executor —
+// the native Rust core on desktop, the TypeScript reference core elsewhere —
+// only understands levels, legs, slots and rules; it never needs to know the
+// word "grid".
+//
+// Everything here is plain JSON (no Date, Map, class or undefined-vs-null
+// ambiguity in required fields) so that a state written by one executor can
+// be read by the other, and so the shared conformance scenarios
+// (./scenarios/*.json) are the single behavioural specification.
+//
+// Determinism: the core never reads a clock or a random source. Time comes
+// from events (`ts`, epoch milliseconds); ids and idempotency keys come from
+// counters stored in the state. Replaying the same events on the same state
+// yields the same state and the same intents — the Rust journal recovery
+// relies on this.
+
+export const EXECUTION_SCHEMA_VERSION = 'execution-v1';
+
+export type Env = 'simulation' | 'production';
+export type Side = 'Buy' | 'Sell';
+export type Market = 'stock' | 'futures';
+
+export interface AccountKey {
+    accountType: 'S' | 'F';
+    brokerId: string;
+    accountId: string;
+}
+
+export interface ContractKey {
+    market: Market;
+    /** Quote-stream code ticks arrive with (may be a continuous alias, e.g. TXFR1). */
+    quoteCode: string;
+    /** Tradable code orders are sent with and deals report (e.g. TXFJ6). */
+    orderCode: string;
+    securityType: 'STK' | 'FUT' | 'OPT';
+}
+
+/** Immutable after creation (#201 environment isolation). A program only
+ * runs, and an intent is only emitted, while the connected server matches
+ * `env` AND `serverId` exactly. */
+export interface Binding {
+    env: Env;
+    /** Server identity (desktop: API base of the local sidecar). */
+    serverId: string;
+    account: AccountKey;
+    contract: ContractKey;
+}
+
+export interface OrderSpec {
+    /** MKP: futures range market (background engine, #226). */
+    priceType: 'MKT' | 'LMT' | 'MKP';
+    timeInForce?: 'ROD' | 'IOC' | 'FOK';
+    /** Futures position effect (bracket/grid exits use Cover). */
+    octype?: 'Auto' | 'New' | 'Cover' | 'DayTrade';
+    stockCond?: 'Cash' | 'MarginTrading' | 'ShortSelling';
+    stockLot?: 'Common' | 'IntradayOdd' | 'Odd' | 'Fixing';
+    /** Stock day-trade short (當沖賣) flag. */
+    daytradeShort?: boolean;
+}
+
+export type TouchCondition = 'below' | 'above'; // fire when last <= / >= price
+
+/** Prices are compared as fixed-point integers (1e-4 units, rounded at the
+ * boundary) so a trigger computed as 0.1 + 0.2 still equals a 0.3 quote. JSON
+ * stays numeric; both cores use exactly this conversion. */
+export const PRICE_SCALE = 10_000;
+
+/** How a level opens its position. */
+/** #226 the price a touch condition watches: absent = last trade; a sell
+ * watches the best bid, a buy the best ask (對手價). */
+/** `odd`: 盤中零股 trades (a 零股 condition, stocks). */
+export type Feed = 'bid' | 'ask' | 'odd';
+
+/** #226 有效期 (`until` epoch ms; 本盤 also ends with its trading session). */
+export interface Validity { type: 'session' | 'today' | 'date'; until: number }
+
+/** One band of a tick-size table: `tick` for `min <= price < max`. */
+export interface TickBand { min: number; max: number | null; tick: number }
+
+export type EntryRule =
+    /** Virtual level: watch price, send `order` when it touches (觸價).
+     * Background engine (#226): `cross` 上穿／下穿 (a new crossing after
+     * every create / restart / reconnect / resume), `feed` 對手價,
+     * `limitTicks` 觸價後限價 (LMT order at the trigger price ± N ticks of the
+     * program's `tickTable`), `validity`. */
+    | { type: 'touch'; condition: TouchCondition; price: number; order: OrderSpec; cross?: boolean; feed?: Feed;
+        limitTicks?: number; validity?: Validity }
+    /** Resting limit order at `price`; submitted once price is on the
+     * non-marketable side (buy: last > price, sell: last < price). */
+    | { type: 'limit'; price: number; order: OrderSpec }
+    /** Entry order placed outside the program (bracket entry sent by the
+     * order ticket); the program only tracks its reports. */
+    | { type: 'external'; orderId: string }
+    /** A position already held when the program starts (a bracket turned
+     * back on in a new trading session, background engine only): no entry
+     * order; `session` is the session it protects in. */
+    | { type: 'position'; session?: string | null }
+    /** #226 時間條件 (background engine): `order` goes out at `at`, or with
+     * `flatten` 全平並取消 of this account / product starts then; missed by
+     * more than a minute it lapses (never late). */
+    | { type: 'time'; at: number; order: OrderSpec; flatten?: 'code' | 'account' }
+    /** #226 分批停利 (background engine): one tier protecting level `of`'s
+     * entry lots from `offset` on (fill order), up to its `qty`. */
+    | { type: 'tier'; of: string; offset: number; index: number; session?: string | null };
+
+/** #226 a tier's rules in legal ticks from the actual fill price. */
+export interface TierRules {
+    stopTicks: number;
+    takeTicks: number | null;
+    trail?: { activateTicks: number; distanceTicks: number; stepTicks: number };
+    breakeven?: { afterTier: number; offsetTicks: number };
+}
+
+/** A touch leg of an exit (stop or take). Fires a market-style order. */
+export interface TouchLeg {
+    price: number;
+    condition: TouchCondition;
+}
+
+/** How a level closes what its entry filled. */
+export type ExitSpec =
+    /** Grid: a resting limit exit at `price` for every entry fill. */
+    | { type: 'takeProfit'; price: number; order: OrderSpec }
+    /** Bracket: OCO pair of touch legs protecting the filled quantity. */
+    | { type: 'oco'; stop: TouchLeg | null; take: TouchLeg | null; order: OrderSpec };
+
+export type LegName = 'entry' | 'stop' | 'take' | 'tp';
+
+/** Cancel request tracking for a working order (stop / bound break). A
+ * program is not stopped until every cancel is confirmed or the order ended
+ * otherwise. A failed attempt is retried (new key per attempt) on the next
+ * tick / reconnect; an unknown one only once CANCEL_UNKNOWN_RETRY_MS passed
+ * without a report settling it; at most MAX_CANCEL_ATTEMPTS attempts. Results
+ * and Cancel reports name the attempt (`key` / `cancelKey`); a stale attempt's
+ * answer never changes the current one. */
+export interface CancelState {
+    key: string;
+    status: 'pendingSubmit' | 'requested' | 'confirmed' | 'failed' | 'unknown';
+    attempts: number;
+    detail: string | null;
+    /** ts the current attempt was emitted. An `unknown` or `requested`
+     * attempt may still be in flight: it is only retried after
+     * CANCEL_UNKNOWN_RETRY_MS, unless a report / reconcile settles it first. */
+    sentAt: number;
+    /** Attempt keys that may still be answered (sent, not yet settled by a
+     * notSent result or a keyed failure). An unkeyed Cancel failure is
+     * attributed to the current attempt only when it is the sole one here. */
+    outstanding: string[];
+}
+
+export type SlotStatus =
+    | 'pendingSubmit' // intent journaled and emitted, no result yet
+    | 'working' // broker accepted
+    | 'filled' // fills cover the quantity
+    | 'ended' // cancelled / failed with the rest unfilled
+    | 'notSent' // refused before any broker request
+    | 'unknown'; // outcome unknown — never resent; only reconcile/ack clears
+
+/** One order the program asked for (or tracks). */
+export interface OrderSlot {
+    /** Idempotency key; the only identity reconciliation may use. */
+    key: string;
+    role: 'entry' | 'exit';
+    leg: LegName;
+    cycle: number;
+    qty: number;
+    status: SlotStatus;
+    orderId: string | null;
+    filled: number;
+    /** fill identity → quantity (`<orderId>:<exchange_seq>` or `event:<id>`). */
+    fills: Record<string, number>;
+    /** fill identity → exchange ts, pairs an event-only fill with its seq row. */
+    fillTs: Record<string, number>;
+    detail: string | null;
+    acknowledged: boolean;
+    cancel: CancelState | null;
+    /** Background engine: the broker said no fill can follow (a successful
+     * Cancel order report, or a final status in a refreshed listing) —
+     * never a cancel request's answer. A later fill is unexpected data. */
+    closed?: boolean;
+    /** Background engine: final in a complete listing with every fill. */
+    listed?: boolean;
+    /** Background engine: fill prices, and the lots a bracket's tiers never
+     * protect (after the order was reported closed / of another session). */
+    fillPx?: Record<string, number>;
+    excluded?: number;
+}
+
+export type RestoreReason = 'restart' | 'disconnect' | 'env' | 'resume' | 'unknownNotSent';
+
+export type LevelPhase =
+    | 'idle' // waiting to enter (touch watching / limit not yet submitted)
+    | 'working' // entry order active, nothing held
+    | 'holding' // position held, exit armed (touch) or about to be placed
+    | 'exiting' // exit order active
+    | 'needsConfirm' // #144: user must send / cancel / keep
+    | 'unknown' // an order outcome is unknown; level frozen
+    | 'done' // finished (no further cycle)
+    | 'disabled'; // refused / acknowledged unknown / user disabled
+
+export interface PendingConfirm {
+    leg: LegName;
+    price: number | null;
+    ts: number;
+    reason: RestoreReason;
+}
+
+export interface Level {
+    id: string;
+    side: Side; // entry side; exits use the opposite side
+    qty: number;
+    entry: EntryRule;
+    exit: ExitSpec | null;
+    phase: LevelPhase;
+    /** Set when the next tick must decide between normal firing and
+     * needsConfirm (#144). */
+    check: RestoreReason | null;
+    /** Legs kept after needsConfirm: fire only after price is seen on the
+     * non-trigger side and crosses again. */
+    recross: LegName[];
+    pending: PendingConfirm | null;
+    orders: OrderSlot[];
+    /** Entry filled minus exit filled in the current cycle. */
+    position: number;
+    /** Entry quantity filled in the current cycle. */
+    entryFilled: number;
+    /** Entry fills that arrived after the exit was dispatched (bracket). */
+    unprotected: number;
+    cycles: number;
+    detail: string | null;
+    /** Background engine, of `unprotected`: entry lots filled after the
+     * order was reported closed — anomalies, notified only, never protected
+     * by itself. */
+    anomalous?: number;
+    /** #226 二擇一 成交後刪對應口數 (background): the level whose order this
+     * one waits for (not watched meanwhile)... */
+    ocoLock?: string;
+    /** ...and that order's fills already taken off this level's quantity. */
+    ocoApplied?: { level: string; filled: number };
+    /** #226 tier (background): its rules, the cost it was priced from (frozen),
+     * the 移動停損 state, 保本 flags. */
+    rules?: TierRules;
+    base?: number;
+    trail?: { active: boolean };
+    beArmed?: boolean;
+    beDone?: boolean;
+}
+
+// ---- generators & policies (parameters; levels are materialised) ----
+
+export type Spacing =
+    | { type: 'pct'; value: number }
+    | { type: 'ticks'; value: number }
+    | { type: 'abs'; value: number }
+    | { type: 'atr'; n: number; k: number; timeframe: string };
+
+export type PriceAnchor =
+    | { type: 'fixed'; price: number }
+    | { type: 'last' }
+    | { type: 'positionCost' }
+    | { type: 'indicator'; ref: string };
+
+export type LevelGenerator =
+    | { type: 'ladder'; anchor: PriceAnchor; spacing: Spacing; count: number; direction: 'down' | 'up';
+        qty: number; takeProfit: Spacing; order: OrderSpec; exitOrder: OrderSpec }
+    | { type: 'range'; upper: number; lower: number; count: number; spacingKind: 'arith' | 'geom';
+        mode: 'long' | 'short' | 'neutral'; qty: number; order: OrderSpec; exitOrder: OrderSpec }
+    | { type: 'proportional'; base: PriceAnchor; upPct: number; downPct: number; tradePct: number;
+        coreMin: number; maxHold: number }
+    | { type: 'dca'; first: OrderSpec; steps: number; stepPct: number; stepScale: number; volumeScale: number };
+
+export interface CyclePolicy {
+    /** After a level's exit fully fills, return to idle and enter again. */
+    rearmAfterExit: boolean;
+    maxCycles: number | null;
+    /** 'immediate': every entry fill places an equal exit at once. */
+    partialFill: 'immediate';
+}
+
+export type BreakAction = 'none' | 'pause' | 'stop';
+
+export interface Bounds {
+    upper: number | null;
+    lower: number | null;
+    onBreakUpper: BreakAction;
+    onBreakLower: BreakAction;
+}
+
+export interface SessionPolicy {
+    /** Resume rule: price already past a touch leg on the first tick after a
+     * restore → needsConfirm (#144). The only rule defined for v1. */
+    resumeRule: 'confirm';
+    /** Protection could not evaluate longer than this → restore check. */
+    longDisconnectMs: number;
+    /** No tick nor heartbeat longer than this → restore check. */
+    silentStallMs: number;
+}
+
+export interface RiskLimits {
+    /** Max entry orders resting at once (others stay virtual). */
+    maxWorkingEntries: number | null;
+}
+
+/** Strategy hook placeholder: event → condition → action. Parsed and kept,
+ * NOT evaluated by the v1 core — a program with hooks is refused at create
+ * time until an evaluator exists. */
+export interface StrategyHook {
+    on: { type: 'barClose'; timeframe: string } | { type: 'tick' } | { type: 'time'; at: string } | { type: 'fill' } | { type: 'programStart' };
+    when: { type: 'expr'; expr: string };
+    then: { type: 'arm' } | { type: 'pause' } | { type: 'resume' } | { type: 'stopAndFlatten' }
+        | { type: 'shiftLevels'; ticks: number } | { type: 'regenerate' } | { type: 'setEntryEnabled'; enabled: boolean }
+        | { type: 'scaleQty'; factor: number };
+    hysteresisBars: number | null;
+}
+
+export type ProgramKind = 'trigger' | 'bracket' | 'grid' | 'custom' | 'flatten';
+export type ProgramStatus = 'running' | 'paused' | 'stopping' | 'stopped';
+/** Why a running program is not sending right now (not a user state). */
+export type ProgramHold = 'envMismatch' | 'disconnected' | 'unknownEnv' | null;
+
+export interface ProgramIssue {
+    code: string;
+    detail: string;
+    ts: number;
+}
+
+export interface OrderProgram {
+    id: string;
+    /** UI classification only; the core never branches on it. */
+    kind: ProgramKind;
+    binding: Binding;
+    /** +1 on every accepted user command; commands carry the version they
+     * were issued against and are refused when stale. */
+    version: number;
+    status: ProgramStatus;
+    pauseReason: string | null;
+    hold: ProgramHold;
+    /** First leg that fires cancels every other level's legs (OCO across
+     * levels, e.g. a manual stop + take pair). */
+    ocoLevels: boolean;
+    levels: Level[];
+    generator: LevelGenerator | null;
+    cycle: CyclePolicy;
+    bounds: Bounds;
+    session: SessionPolicy;
+    risk: RiskLimits;
+    hooks: StrategyHook[];
+    /** Next intent sequence number (part of every idempotency key). */
+    intentSeq: number;
+    issues: ProgramIssue[];
+    createdAt: number;
+    updatedAt: number;
+    /** Bracket behaviour (background engine); absent = the defaults (all off). */
+    policy?: BracketPolicy;
+    /** #226 an order that opens a position: its entries pass the App's risk
+     * checks (background engine). Absent: protective. */
+    opens?: boolean;
+    /** The contract's tick-size table (prices computed in ticks). */
+    tickTable?: TickBand[];
+    /** #226 二擇一 (with `ocoLevels`, background): 'fill' — the other legs wait
+     * for the fired order's final fills and lose exactly what filled;
+     * absent = the first leg that fires ends the others. */
+    ocoMode?: 'trigger' | 'fill';
+}
+
+/** Bracket (括號單) options, background engine (#201 ②). All off by default:
+ * protection is turned back on by the user in a new session, a late entry
+ * fill after protection ended is shown 未受保護, pause stops new entries only. */
+export interface BracketPolicy {
+    autoRearm: boolean;
+    autoProtectLateFill: boolean;
+    pauseStopsExits: boolean;
+}
+
+// ---- engine-level state ----
+
+export interface ConnectionState {
+    live: boolean;
+    env: Env | null;
+    serverId: string | null;
+    /** ts the connection stopped being able to evaluate (null while live). */
+    downSince: number | null;
+    /** Environment last evaluated (a different one on resume = 'env' restore). */
+    lastEvalEnv: Env | null;
+    lastEvalServerId: string | null;
+}
+
+export interface BufferedDeal {
+    deal: DealEvent;
+    ts: number;
+}
+
+export interface BufferedOrder {
+    order: OrderEvent;
+    ts: number;
+}
+
+export interface EngineState {
+    schema: typeof EXECUTION_SCHEMA_VERSION;
+    conn: ConnectionState;
+    /** ts of the last tick or heartbeat seen while evaluating. */
+    lastActivity: number | null;
+    /** Latest trade price per quote code since the connection last changed. */
+    lastPrices: Record<string, number>;
+    /** Deals whose order id is not yet known (report raced the response). */
+    orphanDeals: BufferedDeal[];
+    /** Order reports (e.g. New failed) whose order id is not yet known. */
+    orphanOrders: BufferedOrder[];
+    programs: OrderProgram[];
+}
+
+// ---- events in ----
+
+/** Every market / order / deal / result event names the environment it came
+ * from. The executor routes and matches strictly by it — never by "whatever
+ * is connected now" — so a late simulation tick can never drive production. */
+export interface Source { env: Env; serverId: string }
+
+export interface TickEvent extends Source { type: 'tick'; ts: number; code: string; price: number; simtrade?: boolean;
+    /** a best bid / ask update (background engine), not a trade */
+    feed?: Feed }
+/** Background engine: time passed with an expiry / time rule due. */
+export interface ClockEvent extends Source { type: 'clock'; ts: number }
+export interface HeartbeatEvent extends Source { type: 'heartbeat'; ts: number }
+export interface ConnectionEvent { type: 'connection'; ts: number; live: boolean; env: Env | null; serverId: string | null }
+export interface IntentResultEvent extends Source {
+    type: 'intentResult'; ts: number; key: string;
+    outcome: 'accepted' | 'notSent' | 'unknown';
+    orderId?: string; detail?: string;
+}
+export interface OrderEvent extends Source {
+    type: 'order'; ts: number; orderId: string;
+    op: 'New' | 'Cancel' | 'UpdatePrice' | 'UpdateQty';
+    failed: boolean; detail?: string;
+    /** Cancel reports: the cancel intent key (attempt) this report answers.
+     * Without it, a Cancel failure counts for the current attempt only when
+     * that is the only outstanding one; otherwise the cancel becomes
+     * `unknown` (retried after the timeout unless settled). */
+    cancelKey?: string;
+}
+export interface DealEvent extends Source {
+    type: 'deal'; ts: number; orderId: string;
+    eventId: string | null; seq: string | null;
+    account: { brokerId: string; accountId: string } | null;
+    code: string; action: Side; qty: number; price: number;
+    /** Exchange fill time (epoch s) used to pair event-only fills. */
+    fillTs?: number;
+}
+export interface ReconciledOrder {
+    intentKey: string | null;
+    orderId: string;
+    status: 'working' | 'filled' | 'ended';
+    qty: number;
+    deals: { seq: string; qty: number; price: number; ts?: number }[];
+    /** Background engine: the final status is the engine's own, the row
+     * still lists it working (not evidence that every fill is in). */
+    assumed?: boolean;
+}
+export interface ReconcileEvent {
+    type: 'reconcile'; ts: number;
+    account: AccountKey; env: Env; serverId: string;
+    orders: ReconciledOrder[];
+    /** The listing covers every order of the account today: an unknown
+     * intent whose key is absent was never accepted. */
+    complete: boolean;
+}
+/** The executor (re)started from persisted state. */
+export interface RestoreEvent { type: 'restore'; ts: number }
+
+export type UserCommand =
+    | { op: 'create'; program: OrderProgram }
+    | { op: 'pause'; programId: string; version: number }
+    | { op: 'resume'; programId: string; version: number }
+    | { op: 'stop'; programId: string; version: number }
+    | { op: 'remove'; programId: string; version: number }
+    | { op: 'resolvePending'; programId: string; version: number; levelId: string;
+        choice: 'send' | 'cancel' | 'keep'; allowUnpast?: boolean }
+    | { op: 'ackUnknown'; programId: string; version: number; levelId: string }
+    /** 「我已自行處理」 (background engine only): stop tracking, send nothing. */
+    | { op: 'markHandled'; programId: string; version: number; levelId?: string; note?: string }
+    /** #226 修改 (background engine): the untouched trigger becomes `program` in one step. */
+    | { op: 'replace'; programId: string; version: number; program: OrderProgram };
+
+export interface CommandEvent { type: 'command'; ts: number; id: string; command: UserCommand }
+
+export type ExecEvent =
+    | TickEvent | ClockEvent | HeartbeatEvent | ConnectionEvent | IntentResultEvent | OrderEvent
+    | DealEvent | ReconcileEvent | RestoreEvent | CommandEvent;
+
+// ---- intents out ----
+
+export interface PlaceIntent {
+    kind: 'place';
+    /** Idempotency key, globally unique: `<env>/<encodeURIComponent(serverId)>/
+     * <programId>/<levelId>/<leg>/<cycle>/<seq>` (see intentKey in core.ts). */
+    key: string;
+    programId: string;
+    levelId: string;
+    version: number;
+    role: 'entry' | 'exit';
+    leg: LegName;
+    env: Env;
+    serverId: string;
+    account: AccountKey;
+    orderCode: string;
+    action: Side;
+    qty: number;
+    price: number | null; // null for MKT
+    order: OrderSpec;
+    /** The condition's validity end: never sent at or after it (background engine). */
+    expiresAt?: number;
+}
+
+export interface CancelIntent {
+    kind: 'cancel';
+    key: string;
+    programId: string;
+    levelId: string;
+    version: number;
+    env: Env;
+    serverId: string;
+    account: AccountKey;
+    orderId: string;
+}
+
+export type OrderIntent = PlaceIntent | CancelIntent;
+
+export interface Notice {
+    code: string;
+    programId: string | null;
+    levelId: string | null;
+    detail: string;
+}
+
+export interface StepResult {
+    state: EngineState;
+    intents: OrderIntent[];
+    notices: Notice[];
+}

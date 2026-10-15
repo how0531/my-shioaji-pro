@@ -1,3 +1,7 @@
+import { canTrade } from '../lib/account-tradable';
+import { reportOrderError } from '../lib/order-outcome';
+import { RefreshButton } from './refresh-button';
+import { fetchChartHistory, nextChartHistoryRevision } from '../lib/chart-history';
 // src/components/candle-chart.tsx — K-bar candlestick + volume chart
 // (lightweight-charts v5), live-updated from the SSE tick stream.
 
@@ -21,6 +25,8 @@ import {
     ArrowDown,
     ArrowUp,
     Bell,
+    ArrowUpDown,
+    ChartCandlestick,
     Copy,
     Crosshair,
     Eye,
@@ -32,12 +38,20 @@ import {
     Star,
     X,
 } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { useQuote } from '../hooks/use-stream';
+import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
-    IndicatorDialog,
-    IndicatorSettingsModal,
-} from './indicator-dialog';
+    inOrderLabelArea,
+    orderLineMayTakePointer,
+    useChartDrawings,
+    type ChartDrawingsApi,
+} from '../hooks/use-chart-drawings';
+import {
+    takeDrawingNotices,
+    takeDrawingSaveErrorNotice,
+    useDrawingNotices,
+    useDrawingsSaveFailed,
+} from '../lib/chart-drawings';
+import { useQuote } from '../hooks/use-stream';
 import {
     colorWithOpacity,
     DEF_BY_TYPE,
@@ -51,33 +65,87 @@ import {
     saveInstances,
     type IndicatorInstance,
 } from '../lib/indicator-defs';
+import { IndicatorInstanceContext } from '../lib/indicator-instance-context';
+import {
+    daySessionLabel,
+    filterDaySession,
+    isDaySessionTick,
+    parseChartSessionMode,
+    type ChartSessionMode,
+    supportsSessionSplit,
+    type SessionContractLike,
+} from '../lib/intraday-session';
+import {
+    IndicatorDialog,
+    IndicatorSettingsModal,
+} from './indicator-dialog';
 // side-effect import順序：custom-indicators 在 module 載入時就把已存的
 // 自訂指標註冊進 DEF_BY_TYPE，loadInstances() 的型別過濾才不會把它們丟掉
 import { subscribeCustoms } from '../lib/custom-indicators';
 import type { IndicatorPoint } from '../lib/indicators';
-import { cancelOrder, fetchKbars, updateOrderPrice } from '../lib/shioaji';
-import { setPickedPrice } from '../lib/price-sync';
+import { setHoverPickedPrice, setPickedPrice } from '../lib/price-sync';
+import { cancelOrder, updateOrderPrice } from '../lib/shioaji';
+import { canUpdateOrderPrice } from '../lib/odd-lot';
+import { resetEscCancelArm } from '../lib/esc-cancel-arm';
+import { baseMode, getChartColors, useThemeSettings, themeKey as themeKeyOf } from '../lib/theme-store';
 import { notify, placeQuickOrder } from '../lib/trade';
+import { captureServerMode } from '../lib/server-info-store';
+import { creditEnquireCond, creditSideBlocks, creditStatus, prepareCreditOrder, useCreditEnquire, type CreditCheck } from '../lib/credit-eligibility';
+import { creditLabel } from '../lib/odd-lot';
+import { octypeLabel, quickOrderNote } from '../lib/order-conditions';
+import { ORDER_CONTEXT_CHANGED_MESSAGE, useOrderContext } from '../hooks/use-order-context';
+import {
+    chartModeHint,
+    chartActionCredit,
+    chartCreditTag,
+    chartEffective,
+    chartExitBlocked,
+    chartPlaceOptions,
+    chartTriggerFields,
+    loadChartOrderDefault,
+    normalizeChartOrder,
+    saveChartOrderDefault,
+    type ChartOrderMarket,
+    type ChartOrderPanelState,
+    type ChartOrderSettings,
+} from '../lib/chart-order-settings';
+import { ensureAccounts, useAccounts } from '../lib/account-store';
+import { loadOrderLotPreference, saveOrderLotPreference, QUICK_ORDER_LOTS } from '../lib/order-lot-preference';
+import { accountMatches, resolveFlashAccount } from '../lib/flash-account';
+import { flashAccountLabels } from '../lib/flash-display';
+import { usePrivacyMode } from '../lib/privacy';
+import type { Account } from '../lib/types/portfolio';
+import { ChartOrderButton, type ChartOrderAccountView } from './chart-order-popover';
+import { isCancelUnconfirmed } from '../lib/cancel-verification';
+import { cancellationSummary } from '../lib/trade-mutations';
 import {
     addTrigger,
     removeTrigger,
     useTriggers,
 } from '../lib/trigger-engine';
+import { currentProtectionEnv } from '../lib/protection-env';
 import type { ContractBase } from '../lib/types/contract';
 import type { Candle } from '../lib/types/market';
-import { ACTIVE_ORDER_STATUSES, type Trade } from '../lib/types/order';
+import type { Trade } from '../lib/types/order';
+import { remainingWorkingOrderQuantity } from '../lib/working-order-quantity';
 import { fmtPrice } from '../lib/utils/format';
-import { roundToTick } from '../lib/utils/ticksize';
-import { getChartColors, useThemeSettings } from '../lib/theme-store';
 import {
     aggregate,
     dateStrOffset,
     kbarsToCandles,
-    wallClockToUtc,
+    wallClockToUtc
 } from '../lib/utils/kbars';
-import * as panel from './panel.css';
+import { roundToTick, tickDecimals, tickSizeFor } from '../lib/utils/ticksize';
+import { createOhlcStore } from '../lib/ohlc-legend';
+import { HighLowLayer, type HighLowStyle } from '../lib/chart-highlow';
+import type { ChartColors } from '../lib/theme-store';
+import { OhlcLegend } from './ohlc-legend';
 import * as styles from './candle-chart.css';
-import { Orb } from './orb';
+import { ChartDrawingOverlays, ChartDrawingTools, ChartObjectList } from './chart-drawing-tools';
+import { toolDef } from '../lib/chart-drawings';
+import { AsyncStatus } from './async-status';
+import * as panel from './panel.css';
+import { orderStatusWithNumber } from '../lib/order-status-label';
 
 // NOTE: the kbars API only serves 1-minute bars, so 1D aggregates a huge
 // payload (a year of TXF ≈ 280k bars / 18MB) — keep the range tight enough
@@ -90,10 +158,12 @@ const TIMEFRAMES = [
     { label: '1D', minutes: 1440, days: 240 },
 ] as const;
 
+// 圖表一次只在一種模式：交易模式（頂端工具列武裝）或畫圖／瀏覽模式
+// （左側工具列）。'observe' 不是頂端的按鈕，而是「沒有武裝交易工具」的
+// 中性狀態 — 中性時圖表就歸左側工具列管。
 type TradeMode = 'observe' | 'buy' | 'sell' | 'stop' | 'take' | 'alert';
 
 const TRADE_MODES: { key: TradeMode; label: string }[] = [
-    { key: 'observe', label: '游標' },
     { key: 'buy', label: '點價買' },
     { key: 'sell', label: '點價賣' },
     { key: 'stop', label: '停損' },
@@ -104,14 +174,42 @@ const TRADE_MODES: { key: TradeMode; label: string }[] = [
 // keep paging until this floor — one page per fetch, spans widen with tf
 const MAX_HISTORY_DAYS = 1095; // ~3 years
 
+export type { ChartSessionMode };
+
 export function CandleChart({
+    panelId,
     contract,
     trades = [],
     onOrdersChanged,
+    sessionMode: sessionModeProp,
+    onSessionModeChange,
+    orderSettings: orderSettingsProp,
+    onOrderSettingsChange,
+    showOhlc: showOhlcProp,
+    onShowOhlcChange,
+    showHighLow: showHighLowProp,
+    onShowHighLowChange,
 }: {
+    panelId?: string;
     contract: ContractBase;
     trades?: Trade[];
     onOrdersChanged?: () => void;
+    // 全盤 / 僅日盤。有 onSessionModeChange（主視窗 block）時是受控值
+    // — 缺省 = 全盤，換版面沒帶欄位就回全盤；沒有時（彈出視窗）只當
+    // 初始值，之後用元件內 state
+    sessionMode?: ChartSessionMode;
+    onSessionModeChange?: (mode: ChartSessionMode) => void;
+    // 圖表下單設定（#204）：有 onOrderSettingsChange（主視窗 block）時跟版面
+    // 一起存；沒有時（彈出視窗）只在元件內
+    orderSettings?: ChartOrderPanelState;
+    onOrderSettingsChange?: (next: ChartOrderPanelState) => void;
+    // K 棒讀值列（開高低收，#240）：有 onShowOhlcChange（主視窗 block）時
+    // 跟版面一起存；沒有時（彈出視窗）只在元件內。缺省 = 顯示
+    showOhlc?: boolean;
+    onShowOhlcChange?: (show: boolean) => void;
+    // 可見範圍最高／最低標記（#240）：存法同 K 棒讀值。缺省 = 顯示
+    showHighLow?: boolean;
+    onShowHighLowChange?: (show: boolean) => void;
 }) {
     const hostRef = useRef<HTMLDivElement>(null);
     const chartRef = useRef<IChartApi | null>(null);
@@ -119,31 +217,231 @@ export function CandleChart({
     const volSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
     const lastBarRef = useRef<Candle | null>(null);
     const [tfIdx, setTfIdx] = useState(1); // default 5m
+    // 僅日盤：aggregate 前濾掉夜盤 1 分 K、live 夜盤 tick 不入圖，指標
+    // 也就只吃日盤 K 棒。只開給日盤 08:45–13:45 的期/選，其他商品一律全盤
+    // 存檔值只認 all|day，其餘退回全盤
+    const propMode = parseChartSessionMode(sessionModeProp);
+    const [localSessionMode, setLocalSessionMode] =
+        useState<ChartSessionMode>(propMode ?? 'all');
+    const canDayOnly = supportsSessionSplit(contract as SessionContractLike);
+    const dayOnly =
+        canDayOnly &&
+        (onSessionModeChange ? (propMode ?? 'all') : localSessionMode) ===
+            'day';
+    const pickSessionMode = (m: ChartSessionMode) => {
+        setLocalSessionMode(m);
+        onSessionModeChange?.(m);
+    };
+    const [localShowOhlc, setLocalShowOhlc] = useState(showOhlcProp ?? true);
+    const showOhlc = onShowOhlcChange ? showOhlcProp !== false : localShowOhlc;
+    const toggleOhlc = () => {
+        setLocalShowOhlc(!showOhlc);
+        onShowOhlcChange?.(!showOhlc);
+    };
+    const [localShowHighLow, setLocalShowHighLow] = useState(showHighLowProp ?? true);
+    const showHighLow = onShowHighLowChange ? showHighLowProp !== false : localShowHighLow;
+    const toggleHighLow = () => {
+        setLocalShowHighLow(!showHighLow);
+        onShowHighLowChange?.(!showHighLow);
+    };
+    const highLowRef = useRef<HighLowLayer | null>(null);
+    // 讀值列自己訂閱這個 store：讀值變動只重繪讀值列
+    const ohlcStore = useMemo(createOhlcStore, []);
+    const [hostWidth, setHostWidth] = useState(0);
     const [empty, setEmpty] = useState(false);
     const [loading, setLoading] = useState(false);
+    const [historyError, setHistoryError] = useState(false);
     // 歷史斷層自癒（issue #18）：開盤前抓的歷史可能缺少上游尚未發布的
     // 跨午夜夜盤段，live 進來出現大斷層時補抓一次
     const [historySeq, setHistorySeq] = useState(0);
     const gapReloadAtRef = useRef(0);
+    // 覆蓋率自癒（issue #18 二報）：live 斷層觸發的那次補抓常常太早
+    // （上游還沒發布），live bar 一堆積洞就變「內部洞」再也偵測不到 —
+    // 載入後直接驗覆蓋率，有缺口就退避排程重抓直到上游補齊（封頂）
     // ticks must NOT touch the series until history for the current
     // (symbol, timeframe) is in place — updating a freshly-switched series
     // with a bucket older than its last point makes lightweight-charts
     // throw inside the effect, which unmounts the whole app (issue #1)
     const loadedKeyRef = useRef('');
+    // 圖上目前畫的是哪一組（商品|週期|僅日盤）— 換組時同步清圖
+    const drawnKeyRef = useRef('');
     const quote = useQuote(contract.code);
     const tf = TIMEFRAMES[tfIdx] ?? TIMEFRAMES[1];
     const themeSettings = useThemeSettings();
     const colors = getChartColors(themeSettings);
-    const themeKey = `${themeSettings.mode}-${themeSettings.convention}`;
+    const themeKey = themeKeyOf(themeSettings);
     const [mode, setMode] = useState<TradeMode>('observe');
-    const [tradeQty, setTradeQty] = useState(1);
-    const [instances, setInstances] =
+    // 圖表下單設定（#204）：每張圖自己一組（每市場一份），缺省取「設為預設」
+    const orderMarket: ChartOrderMarket | null =
+        contract.security_type === 'STK' ? 'S'
+            : contract.security_type === 'FUT' || contract.security_type === 'OPT' ? 'F' : null;
+    const [localOrder, setLocalOrder] = useState<ChartOrderPanelState>(() => orderSettingsProp ?? {});
+    const panelOrder = onOrderSettingsChange ? (orderSettingsProp ?? {}) : localOrder;
+    // 沒有自訂過的市場用「設為預設」的值 — 圖表建立時就對股票與期貨兩種
+    // 市場各取一份快照，之後別的圖按「設為預設」不會改到這張圖（包括它之後
+    // 才切到的市場）；這張圖自己的「設為預設」才更新快照（#204）
+    const defaultSnapshot = useRef<Record<ChartOrderMarket, ChartOrderSettings> | null>(null);
+    defaultSnapshot.current ??= { S: loadChartOrderDefault('S'), F: loadChartOrderDefault('F') };
+    const defaultFor = (m: ChartOrderMarket) => defaultSnapshot.current![m];
+    const savedOrder = panelOrder[orderMarket ?? 'S'];
+    const marketSettings: ChartOrderSettings = useMemo(() => {
+        const m = orderMarket ?? 'S';
+        return savedOrder ? normalizeChartOrder(savedOrder, m) : defaultFor(m);
+        // defaultFor reads a per-chart snapshot, stable for the chart's lifetime
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [savedOrder, orderMarket]);
+    const lotPreferences = useRef(new Map<string, ChartOrderSettings['lot']>());
+    const stockSettingsFor = (initial: boolean, previous?: ChartOrderSettings) => {
+        const lot = lotPreferences.current.get(contract.code) ?? loadOrderLotPreference(
+            'chart', contract, QUICK_ORDER_LOTS, initial ? marketSettings.lot : defaultFor('S').lot,
+        );
+        // 換商品不沿用上一檔的單位；股數不能成為張數，零股換檔也歸 1。
+        const reset = lot !== marketSettings.lot || (previous && (previous.lot !== lot || previous.lot === 'IntradayOdd'));
+        return normalizeChartOrder({ ...marketSettings, lot, ...(reset ? { qty: 1 } : {}) }, 'S');
+    };
+    const [stockOrder, setStockOrder] = useState(() => ({
+        code: contract.code, source: savedOrder,
+        settings: orderMarket === 'S' ? stockSettingsFor(true) : marketSettings,
+    }));
+    // 在 render 中先套用新商品，確保行情訂閱與送單 ref 不會短暫使用舊單位。
+    if (orderMarket === 'S' && stockOrder.code !== contract.code) {
+        setStockOrder({ code: contract.code, source: savedOrder, settings: stockSettingsFor(false, stockOrder.settings) });
+    } else if (orderMarket === 'S' && stockOrder.source !== savedOrder) {
+        // 父元件更新帳戶／委託或重建設定物件時，仍以本商品單位解讀數量。
+        const previousSource = normalizeChartOrder(stockOrder.source ?? defaultFor('S'), 'S');
+        const lot = stockOrder.settings.lot;
+        const qty = marketSettings.lot !== lot ? 1
+            : marketSettings.qty === previousSource.qty ? stockOrder.settings.qty : marketSettings.qty;
+        setStockOrder({ ...stockOrder, source: savedOrder, settings: normalizeChartOrder({ ...marketSettings, lot, qty }, 'S') });
+    }
+    const orderSettings = orderMarket === 'S' ? stockOrder.settings : marketSettings;
+    const setOrderSettings = (next: ChartOrderSettings) => {
+        if (!orderMarket) return;
+        const settings = normalizeChartOrder({ ...next, ...(next.lot !== orderSettings.lot ? { qty: 1 } : {}) }, orderMarket);
+        if (orderMarket === 'S') {
+            lotPreferences.current.set(contract.code, settings.lot);
+            saveOrderLotPreference('chart', contract, settings.lot);
+            setStockOrder({ code: contract.code, source: savedOrder, settings });
+        }
+        const value = { ...panelOrder, [orderMarket]: settings };
+        if (onOrderSettingsChange) onOrderSettingsChange(value);
+        else setLocalOrder(value);
+    };
+    const orderSettingsRef = useRef(orderSettings);
+    orderSettingsRef.current = orderSettings;
+    // 點下去實際套用的條件（零股只用 ROD＋現股；設定保留，切回整股恢復）
+    const orderEff = chartEffective(orderSettings, orderMarket ?? 'S');
+    const creditApplies = orderMarket === 'S' && orderSettings.lot === 'Common';
+    // 可否融資券：與閃電共用（只在融資／融券時查，當日快取；確定是 0 才擋，查詢失敗不擋）
+    const creditCond = creditApplies ? creditEnquireCond(orderEff.credit) : null;
+    const creditEnquiry = useCreditEnquire(contract, creditCond !== null);
+    const creditCheck: CreditCheck = creditCond === null ? 'ok'
+        : creditEnquiry.loading ? 'loading' : creditEnquiry.failed ? 'unknown' : creditStatus(creditEnquiry.row, creditCond);
+    const creditSides = creditSideBlocks(contract as { code: string; day_trade?: string }, orderEff.credit, creditCheck);
+    const exitBlocked = orderMarket ? chartExitBlocked(orderSettings, orderMarket) : null;
+    const creditTagText = chartCreditTag(orderEff.credit);
+    // 設定面板信用列下的一句話（同閃電的提示）
+    const creditStatusNote: { text: string; bad: boolean } | undefined = !creditApplies || !creditTagText ? undefined
+        : creditSides.creditBlocked || creditSides.dayTradeBlocked ? { text: (creditSides.creditBlocked ?? creditSides.dayTradeBlocked)!, bad: true }
+            : creditCheck === 'unknown' ? { text: '無法確認可否融資券（不擋單，由券商端決定）', bad: false }
+                : creditCheck === 'loading' ? { text: '確認可否融資券中…', bad: false }
+                    : creditSides.sellOnly ? { text: `${creditTagText}：只能點價賣（${creditTagText}賣出）；點價買停用`, bad: false }
+                        : undefined;
+    // 送單時的固定規則（融券不能買、不可當沖）；可否融資券在點擊時重新查詢
+    const creditRuleRef = useRef(creditSides.rule);
+    creditRuleRef.current = creditSides.rule;
+    // 委託條件的鍵：換信用、當沖、效期、倉別、單位任何一項都算換條件
+    const conditionKey = `${orderSettings.lot}:${orderEff.credit.cond}:${orderEff.credit.daytradeShort ? 'dt' : ''}:${orderEff.orderType}:${orderEff.octype ?? ''}`;
+    // 確認視窗開著時條件改變（換回來也一樣）：那筆不送（同閃電）
+    const captureContext = useOrderContext(contract, conditionKey);
+    // 帳號：沒固定就跟隨主畫面；固定的帳號不可用時絕不改用別的帳號
+    const accountState = useAccounts();
+    const privacy = usePrivacyMode();
+    useEffect(ensureAccounts, []);
+    const orderAccountView: ChartOrderAccountView = useMemo(() => {
+        const m = orderMarket ?? 'S';
+        const eligible = accountState.accounts.filter(a => canTrade(a) && a.account_type === m);
+        const global = m === 'S' ? accountState.selectedStock : accountState.selectedFutures;
+        const resolved = resolveFlashAccount(accountState.accounts, m, orderSettings.accountKey, global, true);
+        const labels = flashAccountLabels(eligible, privacy);
+        return { eligible, active: resolved.account, following: resolved.following, missing: resolved.missing, ...labels };
+    }, [accountState, orderMarket, orderSettings.accountKey, privacy]);
+    const orderAccountRef = useRef(orderAccountView);
+    orderAccountRef.current = orderAccountView;
+    // 點價買賣（一次性）：條件取點下去當下的設定；信用檢查、確認後重查、送出前
+    // 檢查都沿用閃電的共用函式（credit-eligibility／placeQuickOrder）
+    const sendPointOrder = async (
+        c: ContractBase, action: 'Buy' | 'Sell', price: number, settings: ChartOrderSettings, market: ChartOrderMarket,
+        account: Account, isAccountCurrent: () => boolean,
+    ) => {
+        const isContextCurrent = captureContext();
+        const qty = settings.qty;
+        const odd = market === 'S' && settings.lot === 'IntradayOdd';
+        const eff = chartEffective(settings, market);
+        const creditOn = market === 'S' && !odd;
+        const label = creditOn ? chartActionCredit(eff.credit, action) : '';
+        try {
+            // 不能用的一邊不送（不會改成現股）
+            const ruleBlock = creditOn ? creditRuleRef.current[action] : null;
+            if (ruleBlock) throw new Error(ruleBlock);
+            // 伺服器模式在點下去的當下（任何等待之前）就固定
+            const serverMode = captureServerMode();
+            const gate = creditOn ? await prepareCreditOrder(c, action, eff.credit) : null;
+            if (gate?.afterConfirm && !isContextCurrent()) throw new Error(ORDER_CONTEXT_CHANGED_MESSAGE);
+            const trade = await placeQuickOrder(c, action, price, qty, {
+                ...chartPlaceOptions(settings, market), account, isAccountCurrent, serverMode,
+                ...(gate?.afterConfirm ? { afterConfirm: gate.afterConfirm } : {}),
+                beforeSend: () => {
+                    if (!isContextCurrent()) throw new Error(ORDER_CONTEXT_CHANGED_MESSAGE);
+                    gate?.check();
+                    // 確認期間合約更新（例如變成不可當沖）：照目前的規則再看一次
+                    const nowBlocked = creditOn ? creditRuleRef.current[action] : null;
+                    if (nowBlocked) throw new Error(nowBlocked);
+                    if (!isAccountCurrent()) throw new Error('帳戶已變更，已停止後續下單');
+                },
+            });
+            const conditions = quickOrderNote({ market: false, futures: market === 'F', orderType: eff.orderType, octype: eff.octype });
+            notify({
+                kind: 'ok',
+                title: `📈 圖表${label}${action === 'Buy' ? '買進' : '賣出'}已送出`,
+                body: `${c.code} ${qty}${odd ? ' 股（零股）' : ''} @ ${fmtPrice(price)}${conditions ? ` · ${conditions}` : ''}（${orderStatusWithNumber(trade)}）`,
+            });
+        } catch (e) {
+            reportOrderError('圖表下單', e, notify);
+        }
+    };
+    const sendPointOrderRef = useRef(sendPointOrder);
+    sendPointOrderRef.current = sendPointOrder;
+    // 組合商品（合成合約）只能用組合單下單 — 圖上禁用交易模式
+    const isCombo = Boolean((contract as { combo?: unknown }).combo);
+    // 在點價/停損/停利模式中切到組合商品 → 強制回觀察，殘留的交易
+    // 模式不能對組合圖繼續吃點擊
+    useEffect(() => {
+        if (isCombo && mode !== 'observe' && mode !== 'alert') {
+            setMode('observe');
+        }
+    }, [isCombo, mode]);
+    const [legacyInstances, setInstances] =
         useState<IndicatorInstance[]>(loadInstances);
+    const service = useContext(IndicatorInstanceContext);
+    const panelService = panelId ? service : null;
+    const panelState = useSyncExternalStore(
+        panelService?.subscribe ?? (() => () => {}),
+        () => panelService && panelId ? panelService.snapshot(panelId) : null,
+    );
+    useEffect(() => panelService && panelId ? panelService.registerPanel(panelId) : undefined, [panelService, panelId]);
+    const savedInstances = panelState?.instances ?? legacyInstances;
+    const [settingsDraft, setSettingsDraft] = useState<IndicatorInstance | null>(null);
+    const settingsRevisionRef = useRef('');
+    const settingsNewRef = useRef(false);
+    const instances = settingsDraft
+        ? savedInstances.some(i => i.id === settingsDraft.id)
+            ? savedInstances.map(i => i.id === settingsDraft.id ? settingsDraft : i)
+            : [...savedInstances, settingsDraft]
+        : savedInstances;
     const [pickerOpen, setPickerOpen] = useState(false);
     const [settingsFor, setSettingsFor] = useState<string | null>(null);
     const [legendMenuFor, setLegendMenuFor] = useState<string | null>(null);
-    // instances snapshot taken when settings opens — 取消 restores it
-    const settingsSnapshotRef = useRef<string>('');
     // legend live values: instId -> per-output {label,text,color}
     const [legendValues, setLegendValues] = useState<
         Record<string, { label: string; text: string; color: string }[]>
@@ -161,6 +459,9 @@ export function CandleChart({
         >(),
     );
     const legendRafRef = useRef(false);
+    // 同一個 frame 內多次 crosshair 事件只處理最後一次（游標停下時讀值
+    // 對準游標最後所在的 K 棒）
+    const crosshairParamRef = useRef<MouseEventParams | null>(null);
     // sub-pane layout memory: instId -> pane index（上次重建的配置）與
     // instId -> 高度 px（使用者拖出來的上下圖比例，重建時還原）
     const paneAssignRef = useRef(new Map<string, number>());
@@ -186,7 +487,7 @@ export function CandleChart({
                     (t.contract.code === contract.code ||
                         (contract.target_code &&
                             t.contract.code === contract.target_code)) &&
-                    ACTIVE_ORDER_STATUSES.has(t.status.status),
+                    remainingWorkingOrderQuantity(t) > 0,
             ),
         [trades, contract],
     );
@@ -199,11 +500,35 @@ export function CandleChart({
     // refs so the chart click handler always sees current values
     const modeRef = useRef(mode);
     modeRef.current = mode;
-    const qtyRef = useRef(tradeQty);
-    qtyRef.current = tradeQty;
+    const armedDrawingSequenceRef = useRef<number | null>(null);
+    // 武裝時的商品與委託條件：任何一項改變（含外部改變，例如切換版面）就在
+    // 同一次 render 解除點價／停損停利，不等 effect（同閃電）
+    const tradeKey = `${contract.security_type}:${contract.code}:${conditionKey}`;
+    const armedTradeKeyRef = useRef(tradeKey);
+    const setTradeMode = (next: TradeMode) => {
+        modeRef.current = next;
+        armedTradeKeyRef.current = tradeKey;
+        armedDrawingSequenceRef.current = next === 'observe' ? null : drawingsRef.current?.interactionSequence() ?? null;
+        setMode(next);
+    };
+    if (mode !== 'observe' && mode !== 'alert' && armedTradeKeyRef.current !== tradeKey) {
+        modeRef.current = 'observe';
+        armedDrawingSequenceRef.current = null;
+        setMode('observe');
+    }
+    // 這次 render 的模式（解除的那次 render 不再顯示提示）
+    const shownMode: TradeMode = mode !== 'observe' && mode !== 'alert' && armedTradeKeyRef.current !== tradeKey ? 'observe' : mode;
     const contractRef = useRef(contract);
     contractRef.current = contract;
     const lastPriceRef = useRef<number | null>(null);
+    // 零股停損停利：觸價引擎看零股成交價，建立時判斷在現價上方／下方也必須
+    // 用零股成交價（#204），否則兩市場價格分處觸發價兩側時方向會判反
+    const oddChartQuote = useQuote(
+        orderMarket === 'S' && orderSettings.lot === 'IntradayOdd' ? contract.code : null,
+        { oddLot: true },
+    );
+    const oddLastRef = useRef<number | null>(null);
+    oddLastRef.current = oddChartQuote?.tick && Number(oddChartQuote.tick.close) > 0 ? Number(oddChartQuote.tick.close) : null;
 
     // legend readout — crosshair position when hovering, latest bar otherwise
     const fmtLegendVal = (v: number, precision?: number) =>
@@ -236,7 +561,12 @@ export function CandleChart({
                 };
             });
         });
-        setLegendValues(out);
+        // 沒有指標時游標移動不必重繪整張圖表元件
+        setLegendValues((prev) =>
+            legendMetaRef.current.size === 0 && Object.keys(prev).length === 0
+                ? prev
+                : out,
+        );
     };
     const updateLegendRef = useRef(updateLegend);
     updateLegendRef.current = updateLegend;
@@ -294,9 +624,19 @@ export function CandleChart({
         chartRef.current = chart;
         candleSeriesRef.current = candles;
         volSeriesRef.current = vol;
+        // 可見範圍最高／最低標記（#240）：樣式與顯示由下方 effect 套用
+        const highLow = new HighLowLayer({ ...highLowColors(c), visible: false, format: (p) => String(p) });
+        candles.attachPrimitive(highLow);
+        highLowRef.current = highLow;
 
         chart.subscribeClick((param) => {
+            // 第二道防線：畫圖選取／草稿／拖曳／文字／量測均不能進入下單路徑。
+            if (drawingsRef.current?.drawingBusy()) return;
             const m = modeRef.current;
+            // 武裝以後只要發生畫圖互動，這次授權就失效；即使 mode 的更新
+            // 尚未 render 或某入口未清模式，也不得進入 placeQuickOrder。
+            if (m !== 'observe' && (armedDrawingSequenceRef.current === null ||
+                armedDrawingSequenceRef.current !== drawingsRef.current?.interactionSequence())) return;
             if (!param.point) return;
             const raw = candles.coordinateToPrice(param.point.y);
             if (raw === null) return;
@@ -306,38 +646,41 @@ export function CandleChart({
                 setPickedPrice(c.code, price); // sync to order tickets
                 return;
             }
-            const qty = qtyRef.current;
+            const market: ChartOrderMarket = c.security_type === 'STK' ? 'S' : 'F';
+            const settings = orderSettingsRef.current;
+            const qty = settings.qty;
             const last = lastPriceRef.current;
+            const oddLast = oddLastRef.current;
+            const odd = market === 'S' && settings.lot === 'IntradayOdd';
+            const view = orderAccountRef.current;
+            const account: Account | undefined = view.active;
+            modeRef.current = 'observe';
+            armedDrawingSequenceRef.current = null;
             setMode('observe'); // one-shot
+            if (m !== 'alert' && (view.missing || !account)) {
+                notify({ kind: 'err', title: '圖表下單未送出', body: view.missing ? '圖表設定的固定帳號已不可用，請在下單設定重新選擇' : '沒有可用的下單帳號' });
+                return;
+            }
+            // a pinned account must still be this chart's account when the
+            // (optional) confirmation returns
+            const isAccountCurrent = () => accountMatches(orderAccountRef.current.active, account);
             if (m === 'buy' || m === 'sell') {
-                const action = m === 'buy' ? 'Buy' : 'Sell';
-                placeQuickOrder(c, action, price, qty)
-                    .then((trade) =>
-                        notify({
-                            kind: 'ok',
-                            title: `📈 圖表${action === 'Buy' ? '買進' : '賣出'}已送出`,
-                            body: `${c.code} ${qty} @ ${fmtPrice(price)} (${trade.status.status})`,
-                        }),
-                    )
-                    .catch((e) =>
-                        notify({
-                            kind: 'err',
-                            title: '圖表下單失敗',
-                            body: e instanceof Error ? e.message : String(e),
-                        }),
-                    );
+                void sendPointOrderRef.current(c, m === 'buy' ? 'Buy' : 'Sell', price, settings, market, account as Account, isAccountCurrent);
                 return;
             }
             // stop / take triggers — direction inferred from click vs last
-            if (last === null) {
+            // alerts stay on the round-lot price; odd-lot stops/takes decide
+            // their side from the odd-lot trade price they will fire on
+            const ref = m !== 'alert' && odd ? oddLast : last;
+            if (ref === null) {
                 notify({
                     kind: 'err',
                     title: '無法掛觸價單',
-                    body: '尚未收到即時成交價',
+                    body: m !== 'alert' && odd ? '等待零股行情：尚未收到盤中零股成交價' : '尚未收到即時成交價',
                 });
                 return;
             }
-            const below = price <= last;
+            const below = price <= ref;
             if (m === 'alert') {
                 addTrigger({
                     code: c.code,
@@ -349,6 +692,14 @@ export function CandleChart({
                 });
                 return;
             }
+            // 停損停利只送現股：信用條件生效時不建立（按鈕已停用，這裡再擋一次）
+            const exitBlock = chartExitBlocked(settings, market);
+            if (exitBlock) {
+                notify({ kind: 'err', title: '無法掛觸價單', body: exitBlock });
+                return;
+            }
+            const fields = chartTriggerFields(settings, market);
+            const fixed = view.following ? undefined : { account };
             if (m === 'stop') {
                 addTrigger({
                     code: c.code,
@@ -357,7 +708,8 @@ export function CandleChart({
                     action: below ? 'Sell' : 'Buy',
                     quantity: qty,
                     kind: 'stop',
-                });
+                    ...fields,
+                }, c, fixed);
             } else {
                 addTrigger({
                     code: c.code,
@@ -366,18 +718,26 @@ export function CandleChart({
                     action: below ? 'Buy' : 'Sell',
                     quantity: qty,
                     kind: 'take',
-                });
+                    ...fields,
+                }, c, fixed);
             }
         });
 
         chart.subscribeCrosshairMove((param) => {
             // legend value readout follows the crosshair（rAF-throttled）
+            crosshairParamRef.current = param;
             if (!legendRafRef.current) {
                 legendRafRef.current = true;
                 requestAnimationFrame(() => {
                     legendRafRef.current = false;
-                    updateLegendRef.current(
-                        param.point ? param : undefined,
+                    const p = crosshairParamRef.current;
+                    const hovering = p?.point ? p : undefined;
+                    updateLegendRef.current(hovering);
+                    // K 棒讀值：游標所在 K 棒；離開圖表／不在 K 棒上 → 最新一根
+                    ohlcStore.hover(
+                        hovering && typeof hovering.time === 'number'
+                            ? hovering.time
+                            : null,
                     );
                 });
             }
@@ -385,7 +745,8 @@ export function CandleChart({
             const raw = candles.coordinateToPrice(param.point.y);
             if (raw === null) return;
             const c = contractRef.current;
-            setPickedPrice(c.code, roundToTick(c, Number(raw)));
+            // 游標移動帶價受設定控制（#58，預設關閉）；點擊帶價不受影響
+            setHoverPickedPrice(c.code, roundToTick(c, Number(raw)));
         });
 
         // TradingView-style infinite history: panning near the left edge
@@ -399,6 +760,7 @@ export function CandleChart({
             chartRef.current = null;
             candleSeriesRef.current = null;
             volSeriesRef.current = null;
+            highLowRef.current = null;
         };
     }, []);
 
@@ -437,7 +799,6 @@ export function CandleChart({
             wickUpColor: colors.up,
             wickDownColor: colors.down,
         });
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [themeKey]);
 
     // recolor volume bars from cached data on theme change — never refetch
@@ -451,19 +812,75 @@ export function CandleChart({
                 color: b.close >= b.open ? colors.upVol : colors.downVol,
             })),
         );
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [themeKey]);
+
+    // K 棒讀值：歷史載入／換商品／換週期後重算
+    useEffect(() => {
+        ohlcStore.bump();
+    }, [dataVersion, ohlcStore]);
+
+    // 圖表寬度 → 讀值列完整／縮短（窄面板不讓讀值擋住 K 棒）
+    useEffect(() => {
+        const host = hostRef.current;
+        if (!host || typeof ResizeObserver === 'undefined') return;
+        const ro = new ResizeObserver((entries) => {
+            const w = Math.round(entries[0]?.contentRect.width ?? 0);
+            setHostWidth((prev) => (prev === w ? prev : w));
+        });
+        ro.observe(host);
+        return () => ro.disconnect();
+    }, []);
+    // 讀值小數位依跳動價位；指數沒有跳動價位，固定兩位（與價格軸一致）
+    const ohlcDecimals = useMemo(
+        () => (price: number) =>
+            contract.security_type === 'IND'
+                ? 2
+                : tickDecimals(tickSizeFor(contract, price)),
+        [contract],
+    );
+
+    // 最高／最低標記：顯示開關、主題配色、價格小數位（與 K 棒讀值一致）
+    useEffect(() => {
+        highLowRef.current?.setStyle({
+            ...highLowColors(colors),
+            visible: showHighLow,
+            format: (price: number) => {
+                const d = Math.max(0, Math.min(8, ohlcDecimals(price)));
+                return price.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+            },
+        });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [showHighLow, themeKey, ohlcDecimals]);
 
     // load kbars on symbol/timeframe change; pages of older history are
     // pulled on demand by the visible-range subscription (loadMoreRef)
     useEffect(() => {
         let cancelled = false;
-        const loadKey = `${contract.code}|${tf.minutes}`;
+        const loadKey = `${contract.code}|${tf.minutes}|${dayOnly}`;
         loadedKeyRef.current = ''; // freeze tick updates while loading
+        const toRaw = (k: Parameters<typeof kbarsToCandles>[0]) => {
+            const raw = kbarsToCandles(k);
+            return dayOnly
+                ? filterDaySession(contract.security_type, raw)
+                : raw;
+        };
         lastBarRef.current = null;
         loadMoreRef.current = null;
+        // 換商品/週期/全盤↔日盤：新歷史回來前立刻清掉前一組 K 棒 —
+        // 請求還在路上（或卡住）時，不能在「日盤」亮著的狀態下繼續掛著
+        // 日夜盤混合的舊 K 棒。同組重載（更新歷史/斷層補抓）不清，免閃
+        if (drawnKeyRef.current !== loadKey) {
+            drawnKeyRef.current = loadKey;
+            candleSeriesRef.current?.setData([]);
+            volSeriesRef.current?.setData([]);
+            barsRef.current = [];
+            rawRef.current = [];
+            gapReloadAtRef.current = 0;
+            setDataVersion((v) => v + 1); // 指標跟著清
+        }
         setEmpty(false);
         setLoading(true);
+        setHistoryError(false);
         const clearSeries = () => {
             // the series must never keep a stale timeframe's data — a later
             // tick bucketed for the new timeframe would be "older" than the
@@ -506,16 +923,19 @@ export function CandleChart({
             if (dryPages >= 3 || oldestDay >= MAX_HISTORY_DAYS) return;
             fetching = true;
             const from = Math.min(oldestDay + tf.days, MAX_HISTORY_DAYS);
-            fetchKbars(
+            fetchChartHistory(
                 contract,
                 dateStrOffset(from),
                 dateStrOffset(oldestDay + 1),
+                // 長區間翻頁量大 — 放寬 timeout，timeout 誤計 dryPages
+                // 會讓無限捲動提早罷工
+                { timeoutMs: 30_000 },
             )
                 .then((k) => {
                     if (cancelled || loadedKeyRef.current !== loadKey) return;
                     oldestDay = from;
                     const boundary = rawRef.current[0]?.time ?? Infinity;
-                    const older = kbarsToCandles(k).filter(
+                    const older = toRaw(k).filter(
                         (b) => b.time < boundary,
                     );
                     if (older.length === 0) {
@@ -546,10 +966,13 @@ export function CandleChart({
                 });
         };
 
-        fetchKbars(contract, dateStrOffset(tf.days), dateStrOffset(0))
+        fetchChartHistory(contract, dateStrOffset(tf.days), dateStrOffset(0), {
+            revision: historySeq,
+            timeoutMs: 30_000, // 大週期初載可達數十天，不能用 10s
+        })
             .then((k) => {
                 if (cancelled || !candleSeriesRef.current) return;
-                const raw = kbarsToCandles(k);
+                const raw = toRaw(k);
                 const bars = aggregate(raw, tf.minutes);
                 if (bars.length === 0) {
                     clearSeries();
@@ -573,8 +996,10 @@ export function CandleChart({
             })
             .catch(() => {
                 if (cancelled) return;
+                // 保留即時作畫；歷史查詢失敗後由使用者手動更新。
                 clearSeries();
                 setEmpty(true);
+                setHistoryError(true);
             })
             .finally(() => {
                 if (!cancelled) setLoading(false);
@@ -582,8 +1007,7 @@ export function CandleChart({
         return () => {
             cancelled = true;
         };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [contract, tf, historySeq]);
+    }, [contract, tf, historySeq, dayOnly]);
 
     // Live trade/index quote -> update the current bar. Index products use
     // quote_idx rather than the regular tick stream in Shioaji 1.7.
@@ -598,7 +1022,11 @@ export function CandleChart({
         // Y 軸尺度撐爆（issue #5），一律排除
         if ('simtrade' in liveQuote && liveQuote.simtrade) return;
         // history for this (symbol, timeframe) not in place yet
-        if (loadedKeyRef.current !== `${contract.code}|${tf.minutes}`) return;
+        if (
+            loadedKeyRef.current !== `${contract.code}|${tf.minutes}|${dayOnly}`
+        ) {
+            return;
+        }
         const series = candleSeriesRef.current;
         if (!series) return;
         const price = Number(liveQuote.close);
@@ -606,11 +1034,18 @@ export function CandleChart({
         const tickTime = wallClockToUtc(
             `${liveQuote.date}T${liveQuote.time}`,
         );
+        // 僅日盤：夜盤/盤外成交不入圖（與歷史濾法同一套 label 判斷）
+        if (dayOnly && !isDaySessionTick(contract.security_type, tickTime)) {
+            return;
+        }
         const bucketSec = tf.minutes * 60;
+        // close-label-right（與 aggregate/1 分 K 歷史同慣例）：成交 τ 屬
+        // 於哪個「收盤 label」桶 — floor 會把 live 桶標早一格，1 分 K
+        // 時甚至會併進前一分鐘的歷史 bar
         const bucket =
             tf.minutes >= 1440
                 ? Math.floor(tickTime / 86400) * 86400
-                : Math.floor(tickTime / bucketSec) * bucketSec;
+                : Math.floor(tickTime / bucketSec) * bucketSec + bucketSec;
         let bar = lastBarRef.current;
         // live 桶與歷史尾端出現 3 個桶以上的斷層（換時段/上游資料晚發布）
         // → 排程一次歷史補抓把洞補起來；live 桶照常先畫，補抓完成後
@@ -621,7 +1056,7 @@ export function CandleChart({
             Date.now() - gapReloadAtRef.current > 120_000
         ) {
             gapReloadAtRef.current = Date.now();
-            setHistorySeq((v) => v + 1);
+            setHistorySeq(nextChartHistoryRevision());
         }
         if (!bar || bucket > bar.time) {
             bar = {
@@ -661,7 +1096,12 @@ export function CandleChart({
             // a rejected update (e.g. timestamp older than the series tail)
             // must never take the app down — history reload will resync
         }
-    }, [liveQuote, quote?.tick?.volume, contract.code, tf.minutes]);
+        ohlcStore.bump(); // K 棒讀值跟著最新成交
+        // 歷史載入失敗後 live bar 已開始堆 — 圖上有東西就不該再掛
+        // 「無 K 線資料」（同值 setState React 會 bail out）
+        setEmpty(false);
+        setHistoryError(false);
+    }, [liveQuote, quote?.tick?.volume, contract.code, tf.minutes, dayOnly]);
 
     // 自訂指標增刪改 → 重算指標 effect；被刪掉的型別把殘留實例一併清掉
     const [customVer, setCustomVer] = useState(0);
@@ -669,14 +1109,14 @@ export function CandleChart({
         () =>
             subscribeCustoms(() => {
                 setCustomVer((v) => v + 1);
-                setInstances((cur) => {
+                if (!panelService) setInstances((cur) => {
                     const kept = cur.filter((i) => DEF_BY_TYPE.has(i.type));
                     if (kept.length === cur.length) return cur;
                     saveInstances(kept);
                     return kept;
                 });
             }),
-        [],
+        [panelService],
     );
 
     // indicator instances → chart series: overlays on the main pane,
@@ -720,6 +1160,9 @@ export function CandleChart({
         const bars = barsRef.current;
         if (bars.length === 0) {
             paneAssignRef.current = paneAssign; // no panes exist right now
+            // 讀值也要清 — 序列移除了但 legend 讀 legendMetaRef，不清
+            // 會殘留上一檔商品的指標數值（無 K 線資料卻顯示 MA 值）
+            legendMetaRef.current = new Map();
             setPaneTops({});
             return;
         }
@@ -938,32 +1381,40 @@ export function CandleChart({
             paneRoRef.current?.disconnect();
             paneRoRef.current = null;
         };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [dataVersion, instancesKey, themeKey, tf.minutes, customVer]);
 
     const commitInstances = (list: IndicatorInstance[]) => {
+        if (panelService && panelId && panelState) {
+            try { panelService.replace(panelId, list, panelState.revision); }
+            catch (e) { notify({ kind: 'err', title: '指標設定未儲存', body: e instanceof Error ? e.message : String(e) }); }
+            return;
+        }
         setInstances(list);
         saveInstances(list);
     };
     // 點選指標 → 先開設定（圖上即時預覽），確定才算加入、取消整個撤掉
     const addIndicator = (type: string) => {
-        settingsSnapshotRef.current = JSON.stringify(instances); // 不含新實例
         const inst = newInstance(type);
-        commitInstances([...instances, inst]);
+        settingsRevisionRef.current = panelState?.revision ?? '';
+        settingsNewRef.current = true;
+        setSettingsDraft(inst);
         setPickerOpen(false);
         setSettingsFor(inst.id);
     };
     const removeIndicator = (id: string) => {
-        if (settingsFor === id) setSettingsFor(null);
-        commitInstances(instances.filter((i) => i.id !== id));
+        if (settingsFor === id) { setSettingsFor(null); setSettingsDraft(null); }
+        commitInstances(savedInstances.filter((i) => i.id !== id));
     };
     const patchInstance = (id: string, patch: Partial<IndicatorInstance>) => {
+        if (settingsDraft?.id === id) { setSettingsDraft({ ...settingsDraft, ...patch }); return; }
         commitInstances(
             instances.map((i) => (i.id === id ? { ...i, ...patch } : i)),
         );
     };
     const openSettings = (id: string) => {
-        settingsSnapshotRef.current = JSON.stringify(instances);
+        settingsRevisionRef.current = panelState?.revision ?? '';
+        settingsNewRef.current = false;
+        setSettingsDraft(structuredClone(savedInstances.find(i => i.id === id)!));
         setLegendMenuFor(null);
         setSettingsFor(id);
     };
@@ -992,15 +1443,21 @@ export function CandleChart({
         saveFavorites(favs);
     };
     const cancelSettings = () => {
-        try {
-            const snap = JSON.parse(
-                settingsSnapshotRef.current,
-            ) as IndicatorInstance[];
-            commitInstances(snap);
-        } catch {
-            // snapshot unreadable — keep current state
-        }
+        setSettingsDraft(null);
         setSettingsFor(null);
+    };
+    const commitSettings = () => {
+        if (!settingsDraft) return;
+        const list = settingsNewRef.current ? [...savedInstances, settingsDraft]
+            : savedInstances.map(i => i.id === settingsDraft.id ? settingsDraft : i);
+        try {
+            if (panelService && panelId) panelService.replace(panelId, list, settingsRevisionRef.current);
+            else commitInstances(list);
+            cancelSettings();
+        } catch (e) {
+            notify({ kind: 'err', title: '指標設定已變更，請重新開啟設定', body: e instanceof Error ? e.message : String(e) });
+            cancelSettings();
+        }
     };
     const settingsInst = instances.find((i) => i.id === settingsFor) ?? null;
 
@@ -1018,7 +1475,7 @@ export function CandleChart({
         workingOrders.map((t) => [
             t.order.id,
             t.status.modified_price || t.order.price,
-            t.order.quantity - t.status.deal_quantity,
+            remainingWorkingOrderQuantity(t),
         ]),
     );
     useEffect(() => {
@@ -1027,7 +1484,7 @@ export function CandleChart({
         const lines = new Map<string, IPriceLine>();
         for (const t of workingOrdersRef.current) {
             const price = t.status.modified_price || t.order.price;
-            const remaining = t.order.quantity - t.status.deal_quantity;
+            const remaining = remainingWorkingOrderQuantity(t);
             lines.set(
                 t.order.id,
                 series.createPriceLine({
@@ -1036,7 +1493,8 @@ export function CandleChart({
                     lineWidth: 2,
                     lineStyle: 0, // solid
                     axisLabelVisible: true,
-                    title: `${t.order.action === 'Buy' ? '買' : '賣'}${remaining} ⠿`,
+                    // 非現股的委託標出信用條件（融資買2、現沖賣1）
+                    title: `${creditLabel(t.order.action, t.order.order_cond, t.order.daytrade_short) ?? ''}${t.order.action === 'Buy' ? '買' : '賣'}${remaining} ⠿`,
                 }),
             );
         }
@@ -1045,18 +1503,59 @@ export function CandleChart({
             for (const line of lines.values()) series.removePriceLine(line);
             orderLinesRef.current = new Map();
         };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [orderKey, themeKey, contract.code]);
+
+    // 畫圖工具武裝中（下方 useChartDrawings 每次 render 更新）。委託線的
+    // 拖曳 effect 宣告在畫圖 hook 之前，靠這個 ref 讀最新狀態
+    const drawingArmedRef = useRef(false);
+    const drawingsRef = useRef<ChartDrawingsApi | null>(null);
+    const cancelOrderDragRef = useRef<() => boolean>(() => false);
+    const orderDragContext = `${contract.security_type}:${contract.code}:${tf.minutes}:${dayOnly}:${historySeq}`;
+    const orderDragContextRef = useRef(orderDragContext);
+    orderDragContextRef.current = orderDragContext;
+    // 舊委託線被重建前也要還原／解除拖曳；render 後、effect 前的事件由 context 核對阻擋。
+    useLayoutEffect(() => { cancelOrderDragRef.current(); }, [orderDragContext, orderKey, themeKey]);
 
     // drag an order line to modify its price
     useEffect(() => {
         const host = hostRef.current;
         if (!host) return;
-        let dragging: { trade: Trade; line: IPriceLine; price: number } | null =
+        let sequence = 0;
+        let dragging: { trade: Trade; line: IPriceLine; price: number; originalPrice: number; sequence: number; drawingSequence: number; context: string } | null =
             null;
         // active document listeners — removed on unmount if a drag is live
         let activeMove: ((e: MouseEvent) => void) | null = null;
         let activeUp: (() => void) | null = null;
+
+        const releasePointer = () => {
+            if (activeMove) document.removeEventListener('mousemove', activeMove, true);
+            if (activeUp) document.removeEventListener('mouseup', activeUp, true);
+            activeMove = null;
+            activeUp = null;
+            window.removeEventListener('keydown', escape, true);
+            chartRef.current?.applyOptions({ handleScroll: true, handleScale: true });
+            if (host.style.cursor === 'ns-resize') host.style.cursor = '';
+        };
+        const cancel = () => {
+            sequence++;
+            const d = dragging;
+            dragging = null;
+            if (!d) return false;
+            // cleanup 時圖表可能已移除；仍必須釋放 document listeners。
+            try { d.line.applyOptions({ price: d.originalPrice }); } catch { /* series 已釋放 */ }
+            releasePointer();
+            return true;
+        };
+        cancelOrderDragRef.current = cancel;
+        const current = (d: NonNullable<typeof dragging>) => dragging === d && d.sequence === sequence &&
+            d.drawingSequence === drawingsRef.current?.interactionSequence() && d.context === orderDragContextRef.current;
+        const escape = (e: KeyboardEvent) => {
+            if (e.key !== 'Escape' || !dragging) return;
+            drawingsRef.current?.onInteraction();
+            cancel();
+            e.preventDefault();
+            resetEscCancelArm();
+        };
 
         const yOf = (e: MouseEvent) =>
             e.clientY - host.getBoundingClientRect().top;
@@ -1065,25 +1564,60 @@ export function CandleChart({
             const series = candleSeriesRef.current;
             if (!series) return null;
             for (const t of workingOrdersRef.current) {
+                // 零股委託不能改價（#204）：委託線不可拖曳
+                if (!canUpdateOrderPrice(t.order)) continue;
                 const line = orderLinesRef.current.get(t.order.id);
                 if (!line) continue;
                 const coord = series.priceToCoordinate(line.options().price);
                 if (coord !== null && Math.abs(coord - y) <= 6) {
-                    return { trade: t, line };
+                    return { trade: t, line, coord };
                 }
             }
             return null;
         };
 
+        // 畫圖的浮動工具列／文字框蓋在委託線上時，那一下屬於它們
+        const onOverlay = (e: MouseEvent) =>
+            !!(e.target as HTMLElement | null)?.closest?.('[data-drawing-overlay]');
+
+        // 委託線能不能接手這一下（見 orderLineMayTakePointer）。右側把手
+        // 區＝價格軸上委託線自己的價格標籤（不含繪圖區）
+        const mayTake = (e: MouseEvent) => {
+            const d = drawingsRef.current;
+            const rect = host.getBoundingClientRect();
+            const axis = chartRef.current?.priceScale('right').width() ?? 60;
+            const onLabel = inOrderLabelArea(e.clientX - rect.left, rect.width, axis);
+            return orderLineMayTakePointer({
+                drawingLabelAtPointer: onLabel && (d?.drawingLabelAt(e.clientY) ?? false),
+                drawingArmed: drawingArmedRef.current,
+                defaultPrevented: e.defaultPrevented,
+                // 價格軸上沒有畫圖物件（只畫在繪圖區）；線端的命中容差不算
+                drawingHit: onLabel ? null : (d?.drawingAt(e) ?? null),
+                drawingBusy: d?.drawingBusy() ?? false,
+                inGrip: onLabel,
+            });
+        };
+
         const hover = (e: MouseEvent) => {
-            if (dragging) return;
-            host.style.cursor = findNear(yOf(e)) ? 'ns-resize' : '';
+            if (dragging || onOverlay(e)) return;
+            const near = findNear(yOf(e));
+            // 武裝畫圖工具、或這個位置歸畫圖物件時委託線不接手，游標交給畫圖
+            if (!near || !mayTake(e)) {
+                if (host.style.cursor === 'ns-resize') host.style.cursor = '';
+                return;
+            }
+            host.style.cursor = 'ns-resize';
         };
 
         const down = (e: MouseEvent) => {
-            if (e.button !== 0) return;
+            if (e.button !== 0 || onOverlay(e)) return;
+            // 「委託線優先」只在瀏覽模式：武裝畫圖工具時這一下屬於畫圖，
+            // 在委託價附近畫線不能變成改價；別的 handler 已經接手的一下
+            // 也不能同時拖畫圖又送出改價
             const hit = findNear(yOf(e));
-            if (!hit) return;
+            if (!hit || !mayTake(e)) return;
+            // 價格軸把手可接手，但不能與未結束的畫圖拖曳／文字／量測共存。
+            drawingsRef.current?.prepareOrderDrag();
             e.preventDefault();
             e.stopPropagation();
             chartRef.current?.applyOptions({
@@ -1094,11 +1628,17 @@ export function CandleChart({
                 trade: hit.trade,
                 line: hit.line,
                 price: hit.line.options().price,
+                originalPrice: hit.line.options().price,
+                sequence: ++sequence,
+                drawingSequence: drawingsRef.current?.interactionSequence() ?? -1,
+                context: orderDragContextRef.current,
             };
+            const session = dragging;
 
             const move = (ev: MouseEvent) => {
                 const series = candleSeriesRef.current;
-                if (!series || !dragging) return;
+                if (!series || dragging !== session) return;
+                if (!current(session)) { cancel(); return; }
                 const raw = series.coordinateToPrice(yOf(ev));
                 if (raw === null) return;
                 const np = roundToTick(contractRef.current, Number(raw));
@@ -1106,16 +1646,13 @@ export function CandleChart({
                 dragging.line.applyOptions({ price: np });
             };
             const up = () => {
-                document.removeEventListener('mousemove', move, true);
-                document.removeEventListener('mouseup', up, true);
-                activeMove = null;
-                activeUp = null;
-                chartRef.current?.applyOptions({
-                    handleScroll: true,
-                    handleScale: true,
-                });
+                // 遲到的舊 mouseup 不得接手新拖曳，更不能送出舊的改價。
+                if (dragging !== session) return;
+                if (!current(session)) { cancel(); return; }
+                releasePointer();
                 const d = dragging;
                 dragging = null;
+                sequence++;
                 if (!d) return;
                 const orig =
                     d.trade.status.modified_price || d.trade.order.price;
@@ -1145,20 +1682,70 @@ export function CandleChart({
             document.addEventListener('mouseup', up, true);
             activeMove = move;
             activeUp = up;
+            window.addEventListener('keydown', escape, true);
         };
 
         host.addEventListener('mousedown', down, true); // capture: beat chart pan
         host.addEventListener('mousemove', hover, true);
         return () => {
+            cancel();
+            cancelOrderDragRef.current = () => false;
             host.removeEventListener('mousedown', down, true);
             host.removeEventListener('mousemove', hover, true);
-            // unmounted mid-drag — drop the document listeners too
-            if (activeMove) {
-                document.removeEventListener('mousemove', activeMove, true);
-            }
-            if (activeUp) document.removeEventListener('mouseup', activeUp, true);
+            window.removeEventListener('keydown', escape, true);
         };
     }, []);
+
+    // 畫圖工具（issue #122 二／三）。宣告位置有兩個前提（同一個元件的
+    // effect 依宣告順序執行）：
+    // - 在建立圖表的 effect 之後 — 掛 primitive 時 candleSeriesRef 才有值
+    // - 在委託線拖曳的 effect 之後 — host 上的 mousedown／mousemove 由
+    //   委託線先處理：真實委託優先於畫圖物件，游標也由它先決定
+    const barTimesRef = useRef<number[]>([]);
+    useEffect(() => {
+        barTimesRef.current = barsRef.current.map((b) => b.time);
+    }, [dataVersion]);
+    const drawings = useChartDrawings({
+        contract,
+        contextKey: `${tf.minutes}:${dayOnly}:${historySeq}`,
+        hostRef,
+        chartRef,
+        seriesRef: candleSeriesRef,
+        getTimes: () => barTimesRef.current,
+        tradeArmed: mode !== 'observe',
+        onInvalidateInteraction: () => cancelOrderDragRef.current(),
+        onEnterDrawingMode: () => {
+            modeRef.current = 'observe';
+            setMode('observe');
+        },
+        themeMode: baseMode(themeSettings),
+        getBars: () => barsRef.current,
+        // 量測換算損益：期貨／選擇權＝口數 × 乘數；股票＝張數 × 1000 股
+        // （零股＝股數）。不知道乘數時不顯示損益
+        pnlPerPoint: drawingPnlPerPoint(contract, orderMarket, orderSettings),
+        chartBackground: colors.labelBg,
+    });
+    drawingArmedRef.current = drawings.tool !== null;
+    drawingsRef.current = drawings;
+
+    // 畫圖存不進 localStorage（配額滿）— 畫面上的物件還在，但關掉就沒了。
+    // 多張圖同時訂閱，notice 只由第一張拿到的圖發出
+    const drawingsSaveFailed = useDrawingsSaveFailed();
+    useEffect(() => {
+        if (!drawingsSaveFailed || !takeDrawingSaveErrorNotice()) return;
+        notify({
+            kind: 'err',
+            title: '畫圖未能儲存',
+            body: '瀏覽器儲存空間已滿，新的畫圖只保留到關閉視窗為止。請刪除部分畫圖後再試。',
+        });
+    }, [drawingsSaveFailed]);
+
+    // 物件上限、載入截斷、復原／重做衝突共用畫圖通知
+    const drawingNotices = useDrawingNotices();
+    useEffect(() => {
+        if (!drawingNotices.length) return;
+        for (const body of takeDrawingNotices()) notify({ kind: 'err', title: '畫圖工具', body });
+    }, [drawingNotices]);
 
     // draw trigger price lines on the candle series
     useEffect(() => {
@@ -1179,13 +1766,12 @@ export function CandleChart({
                 title:
                     t.kind === 'alert'
                         ? '警示'
-                        : `${t.kind === 'stop' ? '停損' : '停利'}${t.action === 'Buy' ? '買' : '賣'}${t.quantity}`,
+                        : `${t.kind === 'stop' ? '停損' : '停利'}${t.action === 'Buy' ? '買' : '賣'}${t.quantity}${t.orderLot === 'IntradayOdd' ? '股' : ''}`,
             }),
         );
         return () => {
             for (const line of lines) series.removePriceLine(line);
         };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [JSON.stringify(triggers), themeKey, contract.code]);
 
     // 單列 legend（主圖堆疊與各副圖 pane 共用同一套列與控制）
@@ -1410,8 +1996,12 @@ export function CandleChart({
             paneTops[inst.id] === undefined
         );
     });
+    // 交易／畫圖模式提示往下讓出 K 棒讀值那一列，兩者都看得到
+    const hintStyle = showOhlc ? { top: 30 } : undefined;
     return (
-        <div className={styles.wrap}>
+        <div className={styles.wrap}
+            onPointerDownCapture={() => { if (panelService && panelId) panelService.focus(panelId); }}
+            onFocusCapture={() => { if (panelService && panelId) panelService.focus(panelId); }}>
             <div className={styles.toolbar}>
                 {TIMEFRAMES.map((t, i) => (
                     <button
@@ -1422,6 +2012,22 @@ export function CandleChart({
                         {t.label}
                     </button>
                 ))}
+                {canDayOnly && (
+                    // 單一切換鈕（亮＝僅日盤）— 工具列寬度吃緊，不另開
+                    // 「全盤」鈕與分隔線，窄面板才不會提早折行
+                    <button
+                        className={styles.tfBtn[dayOnly ? 'active' : 'normal']}
+                        title={
+                            dayOnly
+                                ? `僅日盤（${daySessionLabel(contract.security_type)}），指標也只用日盤計算 — 點擊切回全盤`
+                                : `全盤（日盤＋夜盤）— 點擊改為僅日盤 ${daySessionLabel(contract.security_type)}`
+                        }
+                        aria-pressed={dayOnly}
+                        onClick={() => pickSessionMode(dayOnly ? 'all' : 'day')}
+                    >
+                        日盤
+                    </button>
+                )}
                 <button
                     className={styles.iconBtn}
                     onClick={resetView}
@@ -1430,39 +2036,70 @@ export function CandleChart({
                 >
                     <Maximize2 size={12} />
                 </button>
+                <button
+                    className={styles.iconBtnToggle[showOhlc ? 'on' : 'off']}
+                    onClick={toggleOhlc}
+                    title={showOhlc ? 'K 棒讀值（開高低收）：顯示中 — 點擊隱藏' : 'K 棒讀值（開高低收）：已隱藏 — 點擊顯示'}
+                    aria-label='K 棒讀值'
+                    aria-pressed={showOhlc}
+                >
+                    <ChartCandlestick size={12} />
+                </button>
+                <button
+                    className={styles.iconBtnToggle[showHighLow ? 'on' : 'off']}
+                    onClick={toggleHighLow}
+                    title={showHighLow ? '最高／最低標記（目前畫面範圍）：顯示中 — 點擊隱藏' : '最高／最低標記（目前畫面範圍）：已隱藏 — 點擊顯示'}
+                    aria-label='最高最低標記'
+                    aria-pressed={showHighLow}
+                >
+                    <ArrowUpDown size={12} />
+                </button>
                 <span className={styles.toolbarDivider} />
-                {TRADE_MODES.map((m) => (
+                {TRADE_MODES.filter(
+                    // 組合商品只能用組合單下單 — 圖上僅保留警示，
+                    // 點價買賣與觸價停損停利（flat code 會被 server 拒）
+                    // 一律不給
+                    (m) => !isCombo || m.key === 'alert',
+                ).map((m) => {
+                    // 這張圖的條件不能送的一邊停用並說明（不會改成現股送出）
+                    const blocked = m.key === 'buy' ? creditSides.buy
+                        : m.key === 'sell' ? creditSides.sell
+                            : m.key === 'stop' || m.key === 'take' ? exitBlocked : null;
+                    const off = !!blocked && creditApplies;
+                    return (
                     <button
                         key={m.key}
-                        className={
-                            styles.modeBtn[
-                                mode === m.key
-                                    ? m.key === 'observe'
-                                        ? 'active'
-                                        : 'armed'
-                                    : 'normal'
-                            ]
-                        }
-                        onClick={() => setMode(m.key)}
+                        className={styles.modeBtn[shownMode === m.key ? 'armed' : 'normal']}
+                        disabled={off || undefined}
+                        title={off ? `${m.label}停用：${blocked}` : `交易模式：${m.label}`}
+                        // 再按一次退出交易模式。頂端不再有「游標」按鈕，
+                        // 這是留在頂端的解除方式（另一個是點左側工具列）
+                        onClick={() => { if (!off) setTradeMode(shownMode === m.key ? 'observe' : m.key); }}
                     >
                         {m.label}
                     </button>
-                ))}
-                <label
-                    className={styles.qtyWrap}
-                    title='圖表下單數量（點價買賣/停損/停利的口數或張數）'
-                >
-                    量
-                    <input
-                        className={styles.qtyInput}
-                        value={tradeQty}
-                        inputMode='numeric'
-                        onChange={(e) => {
-                            const v = Number(e.target.value);
-                            if (Number.isInteger(v) && v >= 1) setTradeQty(v);
+                    );
+                })}
+                {orderMarket && !isCombo && (
+                    <ChartOrderButton
+                        market={orderMarket}
+                        settings={orderSettings}
+                        onChange={setOrderSettings}
+                        onSaveDefault={() => {
+                            saveChartOrderDefault(orderMarket, orderSettings);
+                            defaultSnapshot.current![orderMarket] = orderSettings;
+                            notify({ kind: 'info', title: '已設為圖表下單預設', body: `新開的${orderMarket === 'F' ? '期貨' : '股票'}圖表使用這組設定（不含帳號）；其他現有圖表維持原設定。` });
                         }}
+                        account={orderAccountView}
+                        disabled={creditApplies && !!(creditSides.creditBlocked || creditSides.dayTradeBlocked)}
+                        credit={orderMarket === 'S' ? {
+                            suspended: creditApplies ? null : '零股只能以現股買賣，不能融資、融券或當沖；切回整股時恢復這張圖的信用設定。',
+                            dayTradeOk: (contract as { day_trade?: string }).day_trade === 'Yes',
+                            ...(creditStatusNote ? { status: creditStatusNote } : {}),
+                        } : undefined}
+                        contractLabel={`${contract.code}${(contract as { name?: string }).name ? ` ${(contract as { name?: string }).name}` : ''}`}
                     />
-                </label>
+                )}
                 <button
                     className={
                         styles.indicatorBtn[
@@ -1478,6 +2115,10 @@ export function CandleChart({
                         instances={instances}
                         onAdd={addIndicator}
                         onClose={() => setPickerOpen(false)}
+                        onSaveDefaults={panelService ? () => {
+                            saveInstances(savedInstances);
+                            notify({ kind: 'info', title: '已儲存指標預設', body: '新圖與回測圖表使用此設定；其他現有面板維持原設定。' });
+                        } : undefined}
                     />
                 )}
                 {settingsInst && (
@@ -1491,46 +2132,58 @@ export function CandleChart({
                             patchInstance(settingsInst.id, patch)
                         }
                         onRemove={() => removeIndicator(settingsInst.id)}
-                        onCommit={() => setSettingsFor(null)}
+                        onCommit={commitSettings}
                         onCancel={cancelSettings}
                     />
                 )}
+                <RefreshButton label="更新歷史" loading={loading} onClick={() => setHistorySeq(nextChartHistoryRevision())} />
             </div>
+            <div className={styles.chartRow}>
+            <ChartDrawingTools api={drawings} />
             <div ref={hostRef} className={styles.chartHost}>
                 {loading && (
                     <div className={styles.emptyMsg}>
-                        <Orb size={12} style={{ marginRight: 6, verticalAlign: '-2px' }} />
-                        <span className={panel.mono}>
-                            載入 {tf.label} K 線…
-                        </span>
+                        <AsyncStatus phase='loading' text={`載入 ${tf.label} K 線…`} className={panel.mono} />
                     </div>
                 )}
                 {empty && !loading && (
                     <div className={styles.emptyMsg}>
-                        <span className={panel.mono}>無 K 線資料</span>
+                        <AsyncStatus phase={historyError ? 'error' : 'empty'}
+                            text={historyError ? 'K 線歷史無法取得，請更新歷史' : '無 K 線資料'}
+                            className={panel.mono} />
                     </div>
                 )}
-                {mode !== 'observe' && (
-                    <div className={styles.modeHint}>
-                        {mode === 'buy' && '點擊圖表價位 → 限價買進'}
-                        {mode === 'sell' && '點擊圖表價位 → 限價賣出'}
-                        {mode === 'stop' && '點擊價位掛停損（觸價市價單）'}
-                        {mode === 'take' && '點擊價位掛停利（觸價市價單）'}
-                        {mode === 'alert' && '點擊價位設定到價警示（只通知不下單）'}
+                {shownMode !== 'observe' && (
+                    <div className={styles.modeHint} style={hintStyle}>
+                        交易模式 · {chartModeHint(shownMode, orderSettings, orderMarket ?? 'S')}
                     </div>
                 )}
-                {(workingOrders.length > 0 ||
+                {mode === 'observe' && drawings.tool && (
+                    <div className={styles.drawHint} style={hintStyle}>
+                        畫圖模式 · {toolDef(drawings.tool).label}：{DRAW_HINT[drawings.tool]}（Esc 取消）
+                    </div>
+                )}
+                {(showOhlc ||
+                    workingOrders.length > 0 ||
                     triggers.length > 0 ||
                     instances.length > 0) && (
                     <div className={styles.triggerList}>
+                        {showOhlc && (
+                            <OhlcLegend
+                                store={ohlcStore}
+                                getBars={() => barsRef.current}
+                                decimalsFor={ohlcDecimals}
+                                width={hostWidth}
+                                colors={colors}
+                            />
+                        )}
                         {mainLegendInsts.map((inst) =>
                             renderLegendRow(inst),
                         )}
                         {workingOrders.map((t) => {
                             const price =
                                 t.status.modified_price || t.order.price;
-                            const remaining =
-                                t.order.quantity - t.status.deal_quantity;
+                            const remaining = remainingWorkingOrderQuantity(t);
                             return (
                                 <div
                                     key={t.order.id}
@@ -1553,18 +2206,21 @@ export function CandleChart({
                                         title='刪單'
                                         onClick={() =>
                                             cancelOrder(t.order.id)
-                                                .then(() => {
+                                                .then((trade) => {
+                                                    // Cancelled, filled first, or a working-looking
+                                                    // broker status whose cancel covers everything.
+                                                    const summary = cancellationSummary([{ status: 'fulfilled', value: trade }]);
                                                     notify({
-                                                        kind: 'ok',
-                                                        title: '🗑 刪單已送出',
-                                                        body: `${t.contract.code} @${fmtPrice(price)}`,
+                                                        kind: summary.kind,
+                                                        title: '刪單結果',
+                                                        body: `${t.contract.code} @${fmtPrice(price)}：${summary.body}`,
                                                     });
                                                     onOrdersChangedRef.current?.();
                                                 })
                                                 .catch((e) =>
                                                     notify({
                                                         kind: 'err',
-                                                        title: '刪單失敗',
+                                                        title: isCancelUnconfirmed(e) ? '刪單未確認' : '刪單失敗',
                                                         body:
                                                             e instanceof Error
                                                                 ? e.message
@@ -1591,7 +2247,27 @@ export function CandleChart({
                                     {t.condition === 'below' ? '≤' : '≥'}
                                     {fmtPrice(t.price)}
                                     {t.kind !== 'alert' &&
-                                        ` ${t.action === 'Buy' ? '買' : '賣'}${t.quantity}`}
+                                        ` ${t.action === 'Buy' ? '買' : '賣'}${t.quantity}${t.orderLot === 'IntradayOdd' ? '股' : ''}`}
+                                    {t.suspended && (
+                                        <span title={t.suspended}> 未啟用</span>
+                                    )}
+                                    {t.pending && (
+                                        <span title='離線期間已穿價，未自動送出；請在待確認視窗選擇送出、保留或取消'>
+                                            {' '}待確認
+                                        </span>
+                                    )}
+                                    {t.awaitingRecross && (
+                                        <span title='價格回到觸價另一側後，再次穿價才會觸發'>
+                                            {' '}待重新穿價
+                                        </span>
+                                    )}
+                                    {!t.suspended &&
+                                        t.kind !== 'alert' &&
+                                        t.env !== currentProtectionEnv() && (
+                                            <span title='建立於其他伺服器或模擬／正式模式，目前不執行'>
+                                                {' '}未在此環境
+                                            </span>
+                                        )}
                                 </span>
                                 <button
                                     className={styles.triggerRemove}
@@ -1627,7 +2303,42 @@ export function CandleChart({
                         </div>
                     );
                 })}
+                <ChartDrawingOverlays api={drawings} />
+            </div>
+            <ChartObjectList api={drawings} />
             </div>
         </div>
     );
+}
+
+const DRAW_HINT: Record<string, string> = {
+    horizontal: '點擊價位放置水平線',
+    vertical: '點擊時間放置垂直線',
+    trend: '點兩下決定起點與終點',
+    ray: '點兩下決定起點與方向',
+    extended: '點兩下決定斜率',
+    channel: '點兩下畫基準線，第三下決定通道寬度',
+    box: '點兩下決定方框的兩個對角',
+    fib: '點兩下：起點（1）到終點（0）',
+    text: '點一下放置文字，輸入後按 Enter',
+    measure: '點兩下量測價差、K 棒數與時間',
+};
+
+function drawingPnlPerPoint(
+    contract: ContractBase,
+    market: ChartOrderMarket | null | undefined,
+    s: ChartOrderSettings,
+): number | null {
+    if (market === 'F') {
+        const mult = (contract as { multiplier?: number }).multiplier;
+        return mult && mult > 0 ? mult * s.qty : null;
+    }
+    if (market === 'S') return s.qty * (s.lot === 'IntradayOdd' ? 1 : 1000);
+    return null;
+}
+
+// 最高標記用漲色、最低用跌色（跟著紅漲綠跌／綠漲紅跌設定）；字樣與底色
+// 用圖表標籤的配色，壓在 K 棒上也看得清楚
+function highLowColors(c: ChartColors): Pick<HighLowStyle, 'highColor' | 'lowColor' | 'labelBg' | 'border' | 'mutedText'> {
+    return { highColor: c.up, lowColor: c.down, labelBg: c.labelBg, border: c.border, mutedText: c.text };
 }

@@ -22,12 +22,15 @@ import { LayoutLibrary } from './layout-library';
 import { MarketBar } from './market-bar';
 import { ServerManager } from './server-manager';
 import { SettingsDialog } from './settings-dialog';
+import { flashPopoutParams, reseedPopoutFlashAccounts } from '../lib/flash-account';
+import { mainFlashSelection } from '../lib/order-account';
 import * as styles from './hud-header.css';
 
 const STATUS_LABEL = {
     live: 'LIVE',
     connecting: 'SYNC',
     down: 'LOST',
+    stale: 'STALE',
 } as const;
 
 function Menu({
@@ -152,7 +155,13 @@ function FlashTilesMenu({ flashCodes }: { flashCodes: string[] }) {
                                 className={styles.flashLayoutItem}
                                 onClick={() => {
                                     close();
-                                    void openFlashTiles(flashCodes, lay);
+                                    const global = mainFlashSelection();
+                                    void openFlashTiles(flashCodes, lay, (code) =>
+                                        flashPopoutParams(undefined, global, `tile:${code}`),
+                                        (_code, params) => {
+                                            if (params.win) reseedPopoutFlashAccounts(params.win, undefined, global);
+                                        },
+                                    );
                                 }}
                             >
                                 <FlashThumb layout={lay} />
@@ -248,11 +257,11 @@ export function HudHeader({
     return (
         <header className={styles.header}>
             <div className={styles.logoBlock}>
+                <span className={styles.logoMark} aria-hidden="true" />
                 <span className={styles.logoMain}>Shioaji Pro</span>
                 <span className={styles.logoSub}>
                     交易終端
-                    {appVer &&
-                        ` · ${appVer === 'dev' ? 'Dev' : `App v${appVer}`}`}
+                    {appVer && ` · App ${appVer}`}
                 </span>
             </div>
 
@@ -268,7 +277,7 @@ export function HudHeader({
             <div className={styles.spacer} />
 
             {headerItems.bankBalance && accBalance !== undefined && (
-                <div className={styles.chip}>
+                <div className={`${styles.chip} ${styles.infoAutoHide.second}`}>
                     <span className={styles.chipLabel}>銀行水位</span>
                     <span>{maskMoney(fmtMoney(accBalance), privMoney)}</span>
                 </div>
@@ -331,7 +340,7 @@ export function HudHeader({
             />
 
             {headerItems.clock && (
-                <span className={styles.clock}>
+                <span className={`${styles.clock} ${styles.infoAutoHide.first}`}>
                     {now.toLocaleTimeString('en-GB', { hour12: false })}
                 </span>
             )}

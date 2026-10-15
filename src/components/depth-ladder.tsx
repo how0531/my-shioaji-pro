@@ -2,26 +2,21 @@
 // Clicking a price loads it into the order ticket.
 
 import { useMemo } from 'react';
-import { useQuote } from '../hooks/use-stream';
+import { useDisplayBook } from '../hooks/use-display-book';
+import type { ContractBase } from '../lib/types/contract';
+import type { Snapshot } from '../lib/types/market';
 import { setPickedPrice } from '../lib/price-sync';
 import { fmtInt, fmtPrice } from '../lib/utils/format';
 import * as panel from './panel.css';
 import * as styles from './depth-ladder.css';
 
-export function DepthLadder({ code }: { code: string }) {
+export function DepthLadder({ code, snapshot, contract }: { code: string; snapshot?: Snapshot; contract?: ContractBase }) {
     const onPickPrice = (price: number) => setPickedPrice(code, price);
-    const quote = useQuote(code);
-    const ba = quote?.bidask;
+    const { book } = useDisplayBook(code, snapshot, contract);
 
     const { bids, asks, maxVol, totalBid, totalAsk, spread } = useMemo(() => {
-        const bids = (ba?.bid_price ?? []).map((p, i) => ({
-            price: Number(p),
-            vol: ba?.bid_volume[i] ?? 0,
-        }));
-        const asks = (ba?.ask_price ?? []).map((p, i) => ({
-            price: Number(p),
-            vol: ba?.ask_volume[i] ?? 0,
-        }));
+        const bids = book?.bids ?? [];
+        const asks = book?.asks ?? [];
         const maxVol = Math.max(
             1,
             ...bids.map((b) => b.vol),
@@ -29,12 +24,14 @@ export function DepthLadder({ code }: { code: string }) {
         );
         const totalBid = bids.reduce((s, b) => s + b.vol, 0);
         const totalAsk = asks.reduce((s, a) => s + a.vol, 0);
-        const b1 = bids[0]?.price;
-        const a1 = asks[0]?.price;
+        const b1 = bids[0] && bids[0].vol > 0 ? bids[0].price : undefined;
+        const a1 = asks[0] && asks[0].vol > 0 ? asks[0].price : undefined;
         const spread =
-            b1 && a1 && a1 > b1 ? Number((a1 - b1).toFixed(2)) : null;
+            b1 !== undefined && a1 !== undefined && a1 > b1
+                ? Number((a1 - b1).toFixed(2))
+                : null;
         return { bids, asks, maxVol, totalBid, totalAsk, spread };
-    }, [ba]);
+    }, [book]);
 
     // bid share of the 5-level book — the "買賣力道" gauge
     const bidShare =
@@ -44,6 +41,7 @@ export function DepthLadder({ code }: { code: string }) {
 
     return (
         <div className={styles.grid}>
+                {book?.source === 'snapshot' && <span title={book.time}>快照一檔</span>}
                 <div className={styles.headerRow}>
                     <span>買量</span>
                     <span style={{ textAlign: 'right' }}>BID</span>
@@ -53,15 +51,17 @@ export function DepthLadder({ code }: { code: string }) {
                 {[0, 1, 2, 3, 4].map((i) => {
                     const bid = bids[i];
                     const ask = asks[i];
+                    const hasBid = !!bid && bid.vol > 0;
+                    const hasAsk = !!ask && ask.vol > 0;
                     return (
                         <div key={i} className={styles.ladderRow}>
                             <span className={styles.volText}>
-                                {bid ? fmtInt(bid.vol) : ''}
+                                {hasBid ? fmtInt(bid.vol) : ''}
                             </span>
                             <div
                                 className={styles.barTrack}
                                 onClick={() =>
-                                    bid?.price && onPickPrice(bid.price)
+                                    hasBid && onPickPrice(bid.price)
                                 }
                             >
                                 <div
@@ -71,13 +71,13 @@ export function DepthLadder({ code }: { code: string }) {
                                     }}
                                 />
                                 <span className={styles.priceBid}>
-                                    {bid?.price ? fmtPrice(bid.price) : ''}
+                                    {hasBid ? fmtPrice(bid.price) : ''}
                                 </span>
                             </div>
                             <div
                                 className={styles.barTrack}
                                 onClick={() =>
-                                    ask?.price && onPickPrice(ask.price)
+                                    hasAsk && onPickPrice(ask.price)
                                 }
                             >
                                 <div
@@ -87,11 +87,11 @@ export function DepthLadder({ code }: { code: string }) {
                                     }}
                                 />
                                 <span className={styles.priceAsk}>
-                                    {ask?.price ? fmtPrice(ask.price) : ''}
+                                    {hasAsk ? fmtPrice(ask.price) : ''}
                                 </span>
                             </div>
                             <span className={styles.volTextRight}>
-                                {ask ? fmtInt(ask.vol) : ''}
+                                {hasAsk ? fmtInt(ask.vol) : ''}
                             </span>
                         </div>
                     );
@@ -109,7 +109,7 @@ export function DepthLadder({ code }: { code: string }) {
             </div>
             <div
                 className={styles.forceTrack}
-                title={`五檔買賣力道 買${bidShare.toFixed(0)}%`}
+                title={`${book?.source === 'snapshot' ? '快照一檔' : '五檔'}買賣力道 買${bidShare.toFixed(0)}%`}
             >
                 <div
                     className={styles.forceBid}

@@ -1,3 +1,7 @@
+import { remainingWorkingOrderQuantity } from '../lib/working-order-quantity';
+import { canUpdateOrderPrice, isOddLot, lotLabel } from '../lib/odd-lot';
+import { cancellationSummary } from '../lib/trade-mutations';
+import { isCancelUnconfirmed } from '../lib/cancel-verification';
 // src/components/bottom-dock-orders.tsx — 委託 tab：成交進度圈、狀態篩選、
 // 分帳戶區段、批次刪單（arm-lock 防誤觸）；inline 改價/減量沿用
 
@@ -5,6 +9,7 @@ import { ChevronDown, ChevronRight } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import {
     cancelOrder,
+    cancelOrders,
     updateOrderPrice,
     updateOrderQty,
 } from '../lib/shioaji';
@@ -14,6 +19,7 @@ import type { Trade } from '../lib/types/order';
 import { fmtInt, fmtPrice } from '../lib/utils/format';
 import { vars } from '../theme.css';
 import { Orb } from './orb';
+import { AsyncStatus } from './async-status';
 import * as panel from './panel.css';
 import * as styles from './bottom-dock.css';
 import {
@@ -32,13 +38,14 @@ import {
     type MarketFilter,
     type ViewMode,
 } from './bottom-dock-shared';
+import { orderStatusLabel } from '../lib/order-status-label';
 
 type StatusFilter = 'active' | 'filled' | 'dead' | 'all';
 const STATUS_FILTERS = ['active', 'filled', 'dead', 'all'] as const;
 
 function statusBucket(t: Trade): Exclude<StatusFilter, 'all'> {
     const st = t.status.status;
-    if (ACTIVE_STATUSES.has(st)) return 'active';
+    if (remainingWorkingOrderQuantity(t) > 0) return 'active';
     if (st === 'Filled') return 'filled';
     return 'dead';
 }
@@ -55,7 +62,7 @@ function avgFillPrice(t: Trade): number | null {
 // 成交進度圈：PartFilled 部分填色、Filled 全填、其餘空圈
 function FillRing({ t }: { t: Trade }) {
     const st = t.status.status;
-    const total = t.order.quantity;
+    const total = Math.max(0, t.order.quantity - t.status.cancel_quantity);
     const pct = total > 0 ? Math.min(1, t.status.deal_quantity / total) : 0;
     const r = 5;
     const c = 2 * Math.PI * r;
@@ -90,8 +97,28 @@ function FillRing({ t }: { t: Trade }) {
     );
 }
 
+export function OrderQuantity({ trade }: { trade: Trade }) {
+    const remaining = remainingWorkingOrderQuantity(trade);
+    // 零股委託以股計（#204）；整股／期貨維持原本不加單位
+    const unit = isOddLot(trade.order.order_lot) ? ' 股' : '';
+    return (
+        <span
+            className={styles.ringWrap}
+            title={`原始委託 ${fmtInt(trade.order.quantity)}；已成交 ${fmtInt(trade.status.deal_quantity)}；已取消 ${fmtInt(trade.status.cancel_quantity)}；未成交 ${fmtInt(remaining)}`}
+        >
+            <FillRing t={trade} />
+            <span className={styles.priceDual}>
+                <span>未成交 {fmtInt(remaining)}{unit}</span>
+                <span className={styles.priceDualSub}>
+                    成交 {fmtInt(trade.status.deal_quantity)} · 取消 {fmtInt(trade.status.cancel_quantity)}{unit}
+                </span>
+            </span>
+        </span>
+    );
+}
+
 // inline editor for a working order's qty (減量) or price (改價)
-function OrderEditor({
+export function OrderEditor({
     trade,
     field,
     onChanged,
@@ -106,13 +133,12 @@ function OrderEditor({
         return (
             <button
                 className={styles.cancelBtn}
-                title={field === 'qty' ? '減量（輸入新數量）' : '改價（輸入新價格）'}
+                title={field === 'qty' ? '減量（輸入新的剩餘數量）' : '改價（輸入新價格）'}
                 onClick={() => {
                     setVal(
                         field === 'qty'
                             ? String(
-                                  trade.order.quantity -
-                                      trade.status.deal_quantity,
+                                  remainingWorkingOrderQuantity(trade),
                               )
                             : String(
                                   trade.status.modified_price ||
@@ -128,25 +154,34 @@ function OrderEditor({
     }
     const submit = () => {
         const n = Number(val);
-        const valid =
-            field === 'qty' ? Number.isInteger(n) && n >= 1 : n > 0;
+        const remaining = remainingWorkingOrderQuantity(trade);
+        const valid = field === 'qty'
+            ? Number.isInteger(n) && n > 0 && n < remaining
+            : Number.isFinite(n) && n > 0;
+        if (!valid) {
+            notify({ kind: 'err', title: field === 'qty' ? '未送出減量' : '未送出改價',
+                body: field === 'qty'
+                    ? `新的剩餘數量必須是大於 0 且小於目前剩餘 ${remaining} 的整數；全部取消請使用刪單`
+                    : '請輸入有效的正數價格' });
+            return;
+        }
         if (valid) {
             const req =
                 field === 'qty'
-                    ? updateOrderQty(trade.order.id, n)
+                    ? updateOrderQty(trade.order.id, remaining - n)
                     : updateOrderPrice(trade.order.id, n);
             req.then(() => {
                 notify({
-                    kind: 'ok',
+                    kind: 'info',
                     title: field === 'qty' ? '✏️ 改量已送出' : '✏️ 改價已送出',
-                    body: `${trade.contract.code} → ${n}${field === 'qty' ? '（僅能減量）' : ''}`,
+                    body: `${trade.contract.code} → ${n}；等待回報確認，請手動更新委託核對`,
                 });
                 onChanged();
             }).catch((err) =>
                 notify({
                     kind: 'err',
-                    title: field === 'qty' ? '改量失敗' : '改價失敗',
-                    body: err instanceof Error ? err.message : String(err),
+                    title: field === 'qty' ? '改量失敗或結果未知' : '改價失敗或結果未知',
+                    body: `${err instanceof Error ? err.message : String(err)}；請手動更新委託確認，勿自動重送`,
                 }),
             );
         }
@@ -155,6 +190,7 @@ function OrderEditor({
     return (
         <input
             autoFocus
+            aria-label={field === 'qty' ? '新的剩餘數量' : '新的委託價格'}
             className={styles.qtyInline}
             value={val}
             inputMode={field === 'qty' ? 'numeric' : 'decimal'}
@@ -181,11 +217,7 @@ function orderDetail(t: Trade): string {
         );
     }
     if (t.order.order_lot && t.order.order_lot !== 'Common') {
-        parts.push(
-            { IntradayOdd: '零股', Odd: '零股', Fixing: '定盤', BlockTrade: '鉅額' }[
-                t.order.order_lot
-            ] ?? t.order.order_lot,
-        );
+        parts.push(lotLabel(t.order.order_lot));
     }
     return parts.join(' ');
 }
@@ -198,20 +230,30 @@ interface OrderGroup {
 
 export function OrdersPane({
     trades,
+    initialStatus,
     mode,
     market,
     scopeKey,
     fallback,
     onChanged,
     onSelectCode,
+    onShowAll,
+    showAllRequest,
+    onShowAllRequestHandled,
 }: {
     trades: Trade[];
+    initialStatus: 'loading' | 'failed' | 'ready';
     mode: ViewMode;
     market: MarketFilter;
     scopeKey: string; // '' = 全部帳戶
     fallback: AccountFallback;
     onChanged: () => void;
     onSelectCode: (code: string) => void;
+    // 重設市場/帳戶範圍（由 dock 持有那兩個 state）
+    onShowAll?: () => void;
+    /** non-zero: show every status once (待確認卡「開啟委託查詢」, #201 ③) */
+    showAllRequest?: number;
+    onShowAllRequestHandled?: () => void;
 }) {
     const { ref: measureRef, width } = useMeasuredWidth();
     const size = sizeClassOf(width);
@@ -221,6 +263,11 @@ export function OrdersPane({
         STATUS_FILTERS,
         'active',
     );
+    useEffect(() => {
+        if (!showAllRequest) return;
+        setStatusFilter('all');
+        onShowAllRequestHandled?.();
+    }, [showAllRequest, setStatusFilter, onShowAllRequestHandled]);
     const [armed, setArmed] = useState(false);
     const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
     const [busy, setBusy] = useState<{ done: number; total: number } | null>(
@@ -288,7 +335,7 @@ export function OrdersPane({
         () =>
             new Set(
                 rows
-                    .filter((t) => ACTIVE_STATUSES.has(t.status.status))
+                    .filter((t) => remainingWorkingOrderQuantity(t) > 0)
                     .map((t) => t.order.id),
             ),
         [rows],
@@ -300,37 +347,33 @@ export function OrdersPane({
     };
 
     const doCancel = async (id: string) => {
+        if (cancelling !== null || busy !== null) return;
         setCancelling(id);
         try {
-            await cancelOrder(id);
+            const trade = await cancelOrder(id);
+            notify({ title: '刪單結果', ...cancellationSummary([{ status: 'fulfilled', value: trade }]) });
             onChanged();
-        } catch {
-            // status refresh will surface reality
+        } catch (error) {
+            notify(isCancelUnconfirmed(error)
+                ? { title: '刪單未確認', kind: 'err', body: error.message }
+                : { title: '刪單失敗或結果未知', kind: 'err', body: `${error instanceof Error ? error.message : String(error)}；請手動更新委託確認，勿自動重送` });
         } finally {
             setCancelling(null);
         }
     };
 
-    // 批次刪單：逐筆呼叫 cancelOrder，完成回報筆數
+    // 批次刪單：同時送出各筆 cancelOrder（每筆各自回讀確認，同帳戶讀取共用），
+    // 逐筆完成時更新進度，最後回報確認筆數
     const runBatchCancel = async (ids: string[]) => {
         if (ids.length === 0 || busy || cancelling) return;
         setBusy({ done: 0, total: ids.length });
-        let ok = 0;
-        for (const id of ids) {
-            try {
-                await cancelOrder(id);
-                ok++;
-            } catch {
-                // 留給狀態刷新反映實情
-            }
-            setBusy((b) => (b ? { done: b.done + 1, total: b.total } : b));
-        }
+        const results: PromiseSettledResult<Trade>[] = await cancelOrders(ids,
+            () => setBusy((b) => (b ? { done: b.done + 1, total: b.total } : b)));
         setBusy(null);
         setSelected(new Set());
         notify({
-            kind: ok === ids.length ? 'ok' : 'err',
-            title: '批次刪單完成',
-            body: `已送出 ${ok}/${ids.length} 筆刪單`,
+            title: '批次刪單結果',
+            ...cancellationSummary(results),
         });
         onChanged();
     };
@@ -351,17 +394,10 @@ export function OrdersPane({
         );
     };
 
-    const fillCell = (t: Trade) => (
-        <span className={styles.ringWrap}>
-            <FillRing t={t} />
-            <span>
-                {fmtInt(t.status.deal_quantity)}/{fmtInt(t.order.quantity)}
-            </span>
-        </span>
-    );
+    const fillCell = (t: Trade) => <OrderQuantity trade={t} />;
 
     const selectionCell = (t: Trade) => {
-        const active = ACTIVE_STATUSES.has(t.status.status);
+        const active = remainingWorkingOrderQuantity(t) > 0;
         return (
             <input
                 type='checkbox'
@@ -389,14 +425,14 @@ export function OrdersPane({
     };
 
     const actionsCell = (t: Trade, withEditors: boolean) => {
-        const st = t.status.status;
-        if (!ACTIVE_STATUSES.has(st)) return null;
+        if (remainingWorkingOrderQuantity(t) <= 0) return null;
         return (
             <>
                 {withEditors && (
                     <>
                         <span onClick={(e) => e.stopPropagation()}>
-                            {(t.order.price_type ?? 'LMT') === 'LMT' && (
+                            {/* 零股只能減量／刪單，不提供改價（#204） */}
+                            {canUpdateOrderPrice(t.order) && (
                                 <>
                                     <OrderEditor
                                         trade={t}
@@ -415,7 +451,7 @@ export function OrdersPane({
                 )}
                 <button
                     className={styles.cancelBtn}
-                    disabled={cancelling === t.order.id || busy !== null}
+                    disabled={cancelling !== null || busy !== null}
                     onClick={(e) => {
                         e.stopPropagation();
                         void doCancel(t.order.id);
@@ -447,7 +483,7 @@ export function OrdersPane({
                     <th className={styles.th}>買賣</th>
                     {size === 'wide' && <th className={styles.th}>類別</th>}
                     <th className={styles.th}>價格</th>
-                    <th className={styles.th}>成交/委託</th>
+                    <th className={styles.th}>數量</th>
                     <th className={styles.th}>狀態</th>
                     {size === 'wide' && <th className={styles.th}>訊息</th>}
                     <th className={styles.th} />
@@ -486,11 +522,12 @@ export function OrdersPane({
                             <td className={styles.td}>{fillCell(t)}</td>
                             <td className={styles.td}>
                                 <span
+                                    title={`狀態 ${orderStatusLabel(st)}；原始量 ${t.order.quantity}；成交 ${t.status.deal_quantity}；取消 ${t.status.cancel_quantity}`}
                                     className={
                                         styles.statusChip[statusKind(st)]
                                     }
                                 >
-                                    {st}
+                                    {ACTIVE_STATUSES.has(st) && remainingWorkingOrderQuantity(t) === 0 ? '無未成交量' : orderStatusLabel(st)}
                                 </span>
                             </td>
                             {size === 'wide' && (
@@ -548,9 +585,10 @@ export function OrdersPane({
                             </span>
                             <span className={styles.cardSpacer} />
                             <span
+                                title={`狀態 ${orderStatusLabel(st)}；原始量 ${t.order.quantity}；成交 ${t.status.deal_quantity}；取消 ${t.status.cancel_quantity}`}
                                 className={styles.statusChip[statusKind(st)]}
                             >
-                                {st}
+                                {ACTIVE_STATUSES.has(st) && remainingWorkingOrderQuantity(t) === 0 ? '無未成交量' : orderStatusLabel(st)}
                             </span>
                         </div>
                         <div className={styles.cardLine}>
@@ -605,12 +643,39 @@ export function OrdersPane({
             <div className={styles.paneScroll}>
                 {rows.length === 0 ? (
                     <div className={styles.emptyState}>
-                        NO ORDERS · 無委託
+                        {initialStatus !== 'ready' ? (
+                            <AsyncStatus
+                                phase={initialStatus === 'loading' ? 'loading' : 'error'}
+                                text={initialStatus === 'loading' ? '載入委託…' : '委託尚未確認，請更新'}
+                            />
+                        ) : trades.length === 0 ? (
+                            <AsyncStatus phase='empty' text='NO ORDERS · 無委託' />
+                        ) : (
+                            // 有抓到委託但被篩選隱藏 — 不講清楚會被當成
+                            // 「委託消失」回報（issue #19：持久化的狀態/
+                            // 市場偏好讓清單長期空白）
+                            <>
+                                {trades.length} 筆委託被
+                                {scoped.length === 0
+                                    ? '市場/帳戶範圍'
+                                    : '狀態'}
+                                篩選隱藏{' '}
+                                <button
+                                    className={styles.cancelBtn}
+                                    onClick={() => {
+                                        setStatusFilter('all');
+                                        onShowAll?.();
+                                    }}
+                                >
+                                    顯示全部
+                                </button>
+                            </>
+                        )}
                     </div>
                 ) : mode === 'grouped' ? (
                     groups.map((g) => {
                         const gActive = g.rows.filter((t) =>
-                            ACTIVE_STATUSES.has(t.status.status),
+                            remainingWorkingOrderQuantity(t) > 0,
                         );
                         const isCollapsed = collapsed.has(g.key);
                         return (

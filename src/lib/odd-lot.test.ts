@@ -1,0 +1,165 @@
+// 零股共用規則（#204）：條件組合、單位換算、風控與送出前的最後檢查
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+vi.stubGlobal('window', new EventTarget());
+const store = new Map<string, string>();
+vi.stubGlobal('localStorage', { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v) });
+const api = vi.hoisted(() => ({ post: vi.fn() }));
+vi.mock('./api', () => ({ apiPost: api.post, apiGet: vi.fn(), apiPut: vi.fn(), apiDelete: vi.fn() }));
+
+const odd = await import('./odd-lot');
+const { checkOrderAllowed, setRiskSettings } = await import('./risk');
+
+afterEach(() => setRiskSettings({ enabled: false, maxQty: 0, locked: false }));
+
+const lmt = { price_type: 'LMT', order_type: 'ROD' } as const;
+
+describe('stockOrderProblem', () => {
+    it('accepts cash odd-lot limit ROD orders of 1–999 shares, both sessions', () => {
+        for (const lot of ['IntradayOdd', 'Odd'] as const) {
+            expect(odd.stockOrderProblem({ ...lmt, quantity: 1, order_lot: lot })).toBeNull();
+            expect(odd.stockOrderProblem({ ...lmt, quantity: 999, order_lot: lot, order_cond: 'Cash' })).toBeNull();
+        }
+    });
+    it('blocks margin, short, SBL and day-trade with a plain explanation', () => {
+        for (const cond of ['MarginTrading', 'ShortSelling', 'SBLShort', 'SBLShortPriceExempt']) {
+            expect(odd.stockOrderProblem({ ...lmt, quantity: 100, order_lot: 'IntradayOdd', order_cond: cond })).toBe(odd.ODD_LOT_TEXT.cond);
+        }
+        expect(odd.stockOrderProblem({ ...lmt, quantity: 100, order_lot: 'Odd', daytrade_short: true })).toBe(odd.ODD_LOT_TEXT.daytrade);
+    });
+    it('blocks market, IOC/FOK and out-of-range share counts', () => {
+        expect(odd.stockOrderProblem({ quantity: 100, order_lot: 'IntradayOdd', price_type: 'MKT', order_type: 'IOC' })).toBe(odd.ODD_LOT_TEXT.priceType);
+        expect(odd.stockOrderProblem({ ...lmt, order_type: 'FOK', quantity: 100, order_lot: 'IntradayOdd' })).toBe(odd.ODD_LOT_TEXT.orderType);
+        for (const q of [0, 1000, 1.5]) expect(odd.stockOrderProblem({ ...lmt, quantity: q, order_lot: 'IntradayOdd' })).toBe(odd.ODD_LOT_TEXT.quantity);
+    });
+    it('leaves whole-lot orders to the existing rules', () => {
+        expect(odd.stockOrderProblem({ quantity: 5, order_lot: 'Common', price_type: 'MKT', order_type: 'IOC', order_cond: 'MarginTrading' })).toBeNull();
+        expect(odd.stockOrderProblem({ quantity: 5 })).toBeNull();
+    });
+});
+
+describe('stockOrderProblem — whole-lot credit rules (閃電信用條件)', () => {
+    const base = { ...lmt, quantity: 1, order_lot: 'Common' } as const;
+    it('融券／借券 can only sell: a buy with them is refused', () => {
+        for (const cond of ['ShortSelling', 'SBLShort', 'SBLShortPriceExempt']) {
+            expect(odd.stockOrderProblem({ ...base, action: 'Buy', order_cond: cond })).toBe(odd.CREDIT_TEXT.shortBuy);
+            expect(odd.stockOrderProblem({ ...base, action: 'Sell', order_cond: cond })).toBeNull();
+        }
+    });
+    it('融資 and 現股 are allowed on both sides', () => {
+        for (const action of ['Buy', 'Sell'] as const) {
+            expect(odd.stockOrderProblem({ ...base, action, order_cond: 'MarginTrading' })).toBeNull();
+            expect(odd.stockOrderProblem({ ...base, action, order_cond: 'Cash' })).toBeNull();
+            expect(odd.stockOrderProblem({ ...base, action })).toBeNull();
+        }
+    });
+    it('現股當沖先賣 only for a cash whole-lot sell of a day-trade stock', () => {
+        expect(odd.stockOrderProblem({ ...base, action: 'Sell', daytrade_short: true, day_trade: 'Yes' })).toBeNull();
+        expect(odd.stockOrderProblem({ ...base, action: 'Sell', order_cond: 'Cash', daytrade_short: true, day_trade: 'Yes' })).toBeNull();
+        expect(odd.stockOrderProblem({ ...base, action: 'Buy', daytrade_short: true, day_trade: 'Yes' })).toBe(odd.CREDIT_TEXT.daytradeSide);
+        expect(odd.stockOrderProblem({ ...base, action: 'Sell', order_cond: 'MarginTrading', daytrade_short: true, day_trade: 'Yes' })).toBe(odd.CREDIT_TEXT.daytradeCond);
+        for (const day_trade of ['OnlyBuy', 'No', '', undefined]) {
+            expect(odd.stockOrderProblem({ ...base, action: 'Sell', daytrade_short: true, day_trade })).toBe(odd.CREDIT_TEXT.daytradeStock);
+        }
+        expect(odd.stockOrderProblem({ ...base, action: 'Sell', daytrade_short: false, day_trade: 'No' })).toBeNull();
+        // 只限整股：定盤、鉅額不能當沖先賣
+        for (const order_lot of ['Fixing', 'BlockTrade']) {
+            expect(odd.stockOrderProblem({ ...base, order_lot, action: 'Sell', daytrade_short: true, day_trade: 'Yes' })).toBe(odd.CREDIT_TEXT.daytradeLot);
+        }
+    });
+    it('odd lots keep their own (earlier) explanation', () => {
+        expect(odd.stockOrderProblem({ ...base, order_lot: 'IntradayOdd', action: 'Buy', order_cond: 'ShortSelling' })).toBe(odd.ODD_LOT_TEXT.cond);
+    });
+});
+
+describe('placeStockOrder last check — credit', () => {
+    it('refuses 融券買進 and an ineligible 當沖先賣 before anything is sent', async () => {
+        const { placeStockOrder } = await import('./shioaji');
+        const contract = { code: '2330', security_type: 'STK', exchange: 'TSE', day_trade: 'OnlyBuy' } as never;
+        const order = { price: 1000, quantity: 1, price_type: 'LMT', order_type: 'ROD', order_lot: 'Common' } as const;
+        await expect(placeStockOrder(contract, { ...order, action: 'Buy', order_cond: 'ShortSelling' }))
+            .rejects.toMatchObject({ mutationNotStarted: true, message: odd.CREDIT_TEXT.shortBuy });
+        await expect(placeStockOrder(contract, { ...order, action: 'Sell', daytrade_short: true }))
+            .rejects.toMatchObject({ mutationNotStarted: true, message: odd.CREDIT_TEXT.daytradeStock });
+        expect(api.post).not.toHaveBeenCalled();
+    });
+});
+
+describe('units', () => {
+    it('labels and converts lots and shares', () => {
+        expect(odd.orderQtyUnit(false, 'IntradayOdd')).toBe('股');
+        expect(odd.orderQtyUnit(false, 'Odd')).toBe('股');
+        expect(odd.orderQtyUnit(false, 'Common')).toBe('張');
+        expect(odd.orderQtyUnit(true, 'IntradayOdd')).toBe('口');
+        expect(odd.lotLabel('IntradayOdd')).toBe('盤中零股');
+        expect(odd.lotLabel('Odd')).toBe('盤後零股');
+        expect(odd.sharesToUnits(1500, 'Common')).toBe(1);
+        expect(odd.sharesToUnits(1500, 'IntradayOdd')).toBe(1500);
+        expect(odd.unitsToShares(2, 'Common')).toBe(2000);
+        expect(odd.riskLots(500, 'IntradayOdd')).toBe(0.5);
+        expect(odd.clampLotQuantity(5000, 'IntradayOdd')).toBe(999);
+        expect(odd.clampLotQuantity(0, 'Common')).toBe(1);
+    });
+    it('uses the price limit as the marketable limit price', () => {
+        const c = { limit_up: 110, limit_down: 90 };
+        expect(odd.oddLotMarketablePrice(c, 'Sell')).toBe(90);
+        expect(odd.oddLotMarketablePrice(c, 'Buy')).toBe(110);
+        expect(odd.oddLotMarketablePrice({ limit_up: 0 }, 'Buy')).toBeNull();
+    });
+});
+
+describe('shared risk checks', () => {
+    it('compares odd lots against the per-order cap in 張', () => {
+        setRiskSettings({ enabled: true, maxQty: 1 });
+        expect(checkOrderAllowed(999, 'IntradayOdd')).toBeNull();
+        expect(checkOrderAllowed(2)).toBe('超過單筆上限 1（本筆 2）');
+        setRiskSettings({ enabled: true, maxQty: 0.5 });
+        expect(checkOrderAllowed(600, 'IntradayOdd')).toBe('超過單筆上限 0.5 張（本筆 600 股）');
+    });
+    it('the kill switch blocks odd lots too', () => {
+        setRiskSettings({ locked: true });
+        expect(checkOrderAllowed(1, 'IntradayOdd')).toContain('風控鎖');
+    });
+});
+
+describe('placeStockOrder last check', () => {
+    it('refuses an unsupported odd-lot combination before anything is sent', async () => {
+        const { placeStockOrder } = await import('./shioaji');
+        const contract = { code: '2330', security_type: 'STK', exchange: 'TSE' } as never;
+        await expect(placeStockOrder(contract, { action: 'Buy', price: 1000, quantity: 100, price_type: 'LMT', order_type: 'ROD',
+            order_lot: 'IntradayOdd', order_cond: 'MarginTrading' })).rejects.toMatchObject({ mutationNotStarted: true, message: odd.ODD_LOT_TEXT.cond });
+        await expect(placeStockOrder(contract, { action: 'Sell', price: 0, quantity: 100, price_type: 'MKT', order_type: 'IOC',
+            order_lot: 'Odd' })).rejects.toMatchObject({ mutationNotStarted: true, message: odd.ODD_LOT_TEXT.priceType });
+        expect(api.post).not.toHaveBeenCalled();
+    });
+});
+
+describe('placeFuturesOrder last check — order conditions', () => {
+    it('refuses an unknown 倉別／效期／價別 before anything is sent', async () => {
+        const { placeFuturesOrder } = await import('./shioaji');
+        const { ORDER_CONDITION_TEXT } = await import('./order-conditions');
+        const contract = { code: 'TXFR1', security_type: 'FUT', exchange: 'TAIFEX' } as never;
+        await expect(placeFuturesOrder(contract, { action: 'Buy', price: 100, quantity: 1, price_type: 'LMT', order_type: 'ROD', octype: 'Close' as never }))
+            .rejects.toMatchObject({ mutationNotStarted: true, message: ORDER_CONDITION_TEXT.octype });
+        await expect(placeFuturesOrder(contract, { action: 'Buy', price: 0, quantity: 1, price_type: 'MKP2' as never, order_type: 'IOC' }))
+            .rejects.toMatchObject({ mutationNotStarted: true, message: ORDER_CONDITION_TEXT.priceType });
+        expect(api.post).not.toHaveBeenCalled();
+    });
+});
+
+describe('odd-lot price updates and reference price (#204 follow-up)', () => {
+    it('odd-lot orders cannot change price (Shioaji: IntradayOdd only reduces quantity); whole-lot limits can', () => {
+        expect(odd.canUpdateOrderPrice({ order_lot: 'IntradayOdd', price_type: 'LMT' })).toBe(false);
+        expect(odd.canUpdateOrderPrice({ order_lot: 'Odd', price_type: 'LMT' })).toBe(false);
+        expect(odd.canUpdateOrderPrice({ order_lot: 'Common', price_type: 'LMT' })).toBe(true);
+        expect(odd.canUpdateOrderPrice({ price_type: 'MKT' })).toBe(false);
+        expect(odd.canUpdateOrderPrice({})).toBe(true);
+    });
+    it('the odd-lot reference only comes from odd-lot quotes', () => {
+        const r = (p: number) => Math.round(p);
+        expect(odd.oddLotReferencePrice(undefined, r)).toBeNull();
+        expect(odd.oddLotReferencePrice({ tick: { close: '99' }, bidask: { bid_price: ['96'], ask_price: ['98'] } }, r)).toBe(99);
+        expect(odd.oddLotReferencePrice({ bidask: { bid_price: ['96'], ask_price: ['99'] } }, r)).toBe(98);
+        expect(odd.oddLotReferencePrice({ bidask: { bid_price: ['96'], ask_price: [] } }, r)).toBe(96);
+    });
+});

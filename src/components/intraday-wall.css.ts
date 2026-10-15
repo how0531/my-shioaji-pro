@@ -177,6 +177,19 @@ export const cellPx = style({
     fontWeight: 700,
 });
 
+// 試搓揭示標記（cell 版）— 開盤自動消失
+export const cellSim = style({
+    fontFamily: vars.font.body,
+    fontSize: '0.52rem',
+    fontWeight: 600,
+    padding: '0 2px',
+    borderRadius: vars.radius.sm,
+    color: vars.color.amber,
+    border: '1px solid rgba(224, 164, 60, 0.45)',
+    whiteSpace: 'nowrap',
+    flexShrink: 0,
+});
+
 // 鎖漲停/跌停亮燈（cell 版）
 const cellLockBase = style({
     fontWeight: 700,
@@ -265,4 +278,11 @@ export const centerMsg = style({
     color: vars.color.mutedForeground,
     fontSize: '0.7rem',
     gap: '6px',
+});
+
+export const refreshAction = style({
+    position: 'absolute',
+    top: 2,
+    right: 2,
+    zIndex: 2,
 });

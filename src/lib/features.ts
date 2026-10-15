@@ -25,6 +25,7 @@ export interface ClosedModules {
     agent?: {
         Panel: React.ComponentType<{
             initialPrompt?: string;
+            onboarding?: boolean;
             visibleTabs?: string[];
         }>;
         ensureScheduler: () => void;
@@ -37,6 +38,7 @@ export interface ClosedModules {
         Panel: React.ComponentType<{
             contract: import('./types/contract').ContractInfo | null;
             onPick: (code: string) => void;
+            panelId: string;
         }>;
     };
 }

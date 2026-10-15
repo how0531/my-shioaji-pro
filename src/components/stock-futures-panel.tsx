@@ -1,19 +1,19 @@
+import { RefreshButton } from './refresh-button';
 import { Star } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { useLiveSnapshots } from '../hooks/use-live-snapshots';
 import { primeContract } from '../lib/contracts-cache';
 import {
-    fetchFutures,
-    fetchSnapshots,
+    fetchFutures
 } from '../lib/shioaji';
 import { loadStockCatalog, type StockMeta } from '../lib/stock-index';
 import { notify } from '../lib/trade';
 import type { ContractInfo } from '../lib/types/contract';
-import type { Snapshot } from '../lib/types/market';
 import { fmtPrice, fmtSigned } from '../lib/utils/format';
-import * as panel from './panel.css';
 import * as styles from './derivative-explorer.css';
+import { AsyncStatus } from './async-status';
+import * as panel from './panel.css';
 import { UnderlyingPicker } from './underlying-picker';
-import { Orb } from './orb';
 
 const STOCK_FUTURE_UNDERLYING = 'sj-pro-stock-future-underlying';
 
@@ -26,42 +26,67 @@ function aliasRank(contract: ContractInfo) {
 export function StockFuturesPanel({
     onPick,
     onAdd,
+    contract,
 }: {
     onPick: (code: string) => void;
     onAdd: (contract: ContractInfo) => Promise<unknown>;
+    contract?: ContractInfo | null;
 }) {
     const [underlying, setUnderlying] = useState<StockMeta | null>(null);
+    const [catalog, setCatalog] = useState<StockMeta[]>([]);
     const [contracts, setContracts] = useState<ContractInfo[]>([]);
-    const [snapshots, setSnapshots] = useState<Map<string, Snapshot>>(new Map());
     const [mode, setMode] = useState<'continuous' | 'all'>('continuous');
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(false);
 
     useEffect(() => {
         loadStockCatalog()
-            .then((catalog) => {
+            .then((rows) => {
+                setCatalog(rows);
                 const saved = localStorage.getItem(STOCK_FUTURE_UNDERLYING);
                 setUnderlying(
-                    catalog.find((stock) => stock.code === saved) ??
-                        catalog.find((stock) => stock.code === '2330') ??
-                        catalog[0] ??
+                    rows.find((stock) => stock.code === saved) ??
+                        rows.find((stock) => stock.code === '2330') ??
+                        rows[0] ??
                         null,
                 );
             })
             .catch(() => setError(true));
     }, []);
 
+    // 標準 chrome 連動/釘選：不釘時 contract 跟隨自選選擇 — 點到股票
+    // 直接跟；點到個股期跟它的標的。目錄查不到（無個股期）就不動。
+    useEffect(() => {
+        if (!contract || catalog.length === 0) return;
+        const code =
+            contract.security_type === 'STK'
+                ? contract.code
+                : contract.security_type === 'FUT'
+                  ? contract.underlying_code
+                  : null;
+        if (!code) return;
+        const stock = catalog.find((s) => s.code === code);
+        if (!stock) return;
+        setUnderlying((prev) => (prev?.code === stock.code ? prev : stock));
+        localStorage.setItem(STOCK_FUTURE_UNDERLYING, stock.code);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [contract?.code, catalog]);
+
     useEffect(() => {
         if (!underlying) return;
+        let active = true;
+        setContracts([]);
         setLoading(true);
         setError(false);
         fetchFutures({ underlyingCode: underlying.code })
-            .then((rows) => setContracts(rows))
+            .then((rows) => { if (active) setContracts(rows); })
             .catch(() => {
+                if (!active) return;
                 setContracts([]);
                 setError(true);
             })
-            .finally(() => setLoading(false));
+            .finally(() => { if (active) setLoading(false); });
+        return () => { active = false; };
     }, [underlying]);
 
     const visible = useMemo(() => {
@@ -77,32 +102,14 @@ export function StockFuturesPanel({
         );
     }, [contracts, mode]);
 
-    const visibleKey = visible.map((contract) => contract.code).join(',');
-    const refresh = useCallback(async () => {
-        if (!visibleKey) {
-            setSnapshots(new Map());
-            return;
-        }
-        try {
-            const rows = await fetchSnapshots(visible.slice(0, 40));
-            setSnapshots(new Map(rows.map((row) => [row.code, row])));
-        } catch {
-            // Keep the latest successful quote set.
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [visibleKey]);
-
-    useEffect(() => {
-        void refresh();
-        const timer = setInterval(refresh, 5000);
-        return () => clearInterval(timer);
-    }, [refresh]);
+    const { snapshots: snapshots, refresh: refreshQuotes, loading: quotesLoading, error: quotesError } = useLiveSnapshots(visible.slice(0, 40));
 
     const roots = new Set(contracts.map((contract) => contract.root).filter(Boolean));
 
     return (
         <div className={styles.wrap}>
             <div className={styles.toolbar}>
+                {quotesError && <span role="status">{quotesError}；保留上次報價</span>}
                 <UnderlyingPicker
                     value={underlying}
                     onChange={(stock) => {
@@ -122,6 +129,7 @@ export function StockFuturesPanel({
                 >
                     全月份
                 </button>
+                <RefreshButton label="更新報價" loading={quotesLoading} onClick={() => void refreshQuotes()} />
             </div>
             <div className={styles.summary}>
                 <span className={styles.summaryStrong}>
@@ -132,13 +140,12 @@ export function StockFuturesPanel({
             </div>
             {loading ? (
                 <div className={styles.empty}>
-                    <Orb size={12} style={{ marginRight: 6, verticalAlign: '-2px' }} />
-                    載入個股期合約…
+                    <AsyncStatus phase='loading' text='載入個股期合約…' />
                 </div>
             ) : error ? (
-                <div className={styles.error}>個股期合約載入失敗</div>
+                <div className={styles.error}><AsyncStatus phase='error' text='個股期合約載入失敗' /></div>
             ) : visible.length === 0 ? (
-                <div className={styles.empty}>此標的目前沒有個股期</div>
+                <div className={styles.empty}><AsyncStatus phase='empty' text='此標的目前沒有個股期' /></div>
             ) : (
                 <div className={styles.scroll}>
                     <table className={styles.table}>

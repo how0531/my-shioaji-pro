@@ -1,22 +1,23 @@
+import { RefreshButton } from './refresh-button';
 // src/components/tray-panel.tsx — compact menu-bar dropdown panel.
 // Sections are user-configurable (gear): 持倉損益 / 自選清單 / 排行榜.
 // Clicking any symbol focuses the main window and links it everywhere.
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { usePoll } from '../hooks/use-poll';
-import { useQuote } from '../hooks/use-stream';
-import { useWatchlist } from '../hooks/use-watchlist';
 import { Maximize2, Settings2 } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useQuery } from '../hooks/use-query';
+import { useQuote } from '../hooks/use-stream';
+import type { WatchItem } from '../hooks/use-watchlist';
+import { useWatchlist } from '../hooks/use-watchlist';
 import { maskMoney, usePrivacyMoney } from '../lib/privacy';
 import { isTauri } from '../lib/runtime';
 import {
-    fetchPositions,
-    fetchScanner,
+    fetchScanner
 } from '../lib/shioaji';
 import { getAliasFor } from '../lib/stream';
-import type { WatchItem } from '../hooks/use-watchlist';
+import { useTradingState } from '../lib/trading-state';
+import { queryDisplayState } from '../lib/query-display-state';
 import type { ScannerItem } from '../lib/types/market';
-import type { Position } from '../lib/types/portfolio';
 import {
     fmtInt,
     fmtPct,
@@ -24,10 +25,10 @@ import {
     fmtSigned,
     fmtStockLots,
 } from '../lib/utils/format';
-import { Sparkline } from './sparkline';
+import { AsyncStatus } from './async-status';
 import * as panel from './panel.css';
+import { Sparkline } from './sparkline';
 import * as styles from './tray-panel.css';
-import { Orb } from './orb';
 
 type SectionKey = 'positions' | 'watchlist' | 'movers';
 
@@ -116,22 +117,11 @@ export function TrayPanel() {
     );
     const [gearOpen, setGearOpen] = useState(false);
     const privMoney = usePrivacyMoney();
-    const { items } = useWatchlist();
+    const { items, loading: watchlistLoading, loadError: watchlistError } = useWatchlist();
 
-    const positionsPoll = usePoll<Position[]>(
-        useCallback(async () => {
-            const [st, fu] = await Promise.allSettled([
-                fetchPositions('S'),
-                fetchPositions('F'),
-            ]);
-            return [
-                ...(st.status === 'fulfilled' ? st.value : []),
-                ...(fu.status === 'fulfilled' ? fu.value : []),
-            ];
-        }, []),
-        8000,
-    );
-    const moversPoll = usePoll<ScannerItem[]>(
+    const portfolio = useTradingState();
+    const positionsQuery = portfolio.queries.positions;
+    const moversPoll = useQuery<ScannerItem[]>(
         useCallback(
             () =>
                 sections.has('movers')
@@ -139,10 +129,13 @@ export function TrayPanel() {
                     : Promise.resolve([]),
             [sections],
         ),
-        30000,
+        'tray-movers', sections.has('movers'),
     );
 
-    const positions = positionsPoll.data ?? [];
+    const positions = portfolio.positions;
+    const positionsState = queryDisplayState(positionsQuery);
+    const positionsFailed = positionsState === 'failed';
+    const positionsPending = positionsState === 'loading';
     const totalPnl = positions.reduce((s, p) => s + (p.pnl || 0), 0);
     const topPositions = useMemo(
         () =>
@@ -186,6 +179,7 @@ export function TrayPanel() {
                         ? `未實現 ${maskMoney(fmtSigned(Math.round(totalPnl), 0), privMoney)}`
                         : ''}
                 </span>
+                <RefreshButton label="更新排行" loading={moversPoll.loading} onClick={() => void moversPoll.refresh()} />
                 <button
                     className={styles.gearBtn}
                     title='自訂顯示內容'
@@ -236,10 +230,15 @@ export function TrayPanel() {
                 {sections.has('positions') && (
                     <>
                         <span className={styles.sectionTitle}>
-                            持倉 [{positions.length}]
+                            持倉 [{positionsQuery.updatedAt !== null && !positionsFailed ? positions.length : positions.length > 0 ? `${positions.length}+` : '…'}]
                         </span>
                         {topPositions.length === 0 && (
-                            <span className={styles.empty}>無持倉</span>
+                            <span className={styles.empty}>
+                                <AsyncStatus
+                                    phase={positionsPending ? 'loading' : positionsFailed ? 'error' : 'empty'}
+                                    text={positionsPending ? '載入持倉…' : positionsFailed ? '持倉尚未確認' : '無持倉'}
+                                />
+                            </span>
                         )}
                         {topPositions.map((p) => {
                             const dir =
@@ -259,10 +258,13 @@ export function TrayPanel() {
                                     </span>
                                     <span className={styles.name}>
                                         {p.direction === 'Buy' ? '多' : '空'}{' '}
-                                        {'yd_quantity' in p
-                                            ? fmtStockLots(p.quantity)
-                                            : fmtInt(p.quantity)}{' '}
-                                        @{fmtPrice(p.price)}
+                                        {maskMoney(
+                                            'yd_quantity' in p
+                                                ? fmtStockLots(p.quantity)
+                                                : fmtInt(p.quantity),
+                                            privMoney,
+                                        )}{' '}
+                                        @{maskMoney(fmtPrice(p.price), privMoney)}
                                     </span>
                                     <span
                                         className={`${styles.num} ${panel.dirText[dir]}`}
@@ -290,9 +292,14 @@ export function TrayPanel() {
                         ))}
                         {items.length === 0 && (
                             <span className={styles.empty}>
-                                <Orb size={12} style={{ marginRight: 6, verticalAlign: '-2px' }} />
-                                清單載入中…
+                                <AsyncStatus
+                                    phase={watchlistLoading ? 'loading' : watchlistError ? 'error' : 'empty'}
+                                    text={watchlistLoading ? '載入清單…' : watchlistError ? '自選清單尚未取得' : '自選清單是空的'}
+                                />
                             </span>
+                        )}
+                        {watchlistLoading && items.length > 0 && (
+                            <span className={styles.empty}><AsyncStatus phase='loading' text='載入其餘商品…' /></span>
                         )}
                     </>
                 )}
@@ -337,6 +344,14 @@ export function TrayPanel() {
                                 </button>
                             );
                         })}
+                        {(moversPoll.data?.length ?? 0) === 0 && (
+                            <span className={styles.empty}>
+                                <AsyncStatus
+                                    phase={moversPoll.error ? 'error' : moversPoll.updatedAt === null ? 'loading' : 'empty'}
+                                    text={moversPoll.error ? '排行尚未取得' : moversPoll.updatedAt === null ? '載入排行…' : '目前沒有排行資料'}
+                                />
+                            </span>
+                        )}
                     </>
                 )}
             </div>

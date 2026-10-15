@@ -10,8 +10,11 @@ export const wrap = style({
     minHeight: 0,
 });
 
+// 窄面板放不下時換行（不把按鈕擠成直排字、右端按鈕不被裁掉）；不用
+// overflow 捲動 — 那會把掛在按鈕下的彈出面板一起裁掉
 export const toolbar = style({
     display: 'flex',
+    flexWrap: 'wrap',
     gap: '2px',
     padding: `4px ${vars.space.sm}`,
     borderBottom: `1px solid ${vars.color.border}`,
@@ -19,6 +22,7 @@ export const toolbar = style({
 });
 
 const tfBase = style({
+    whiteSpace: 'nowrap',
     fontFamily: vars.font.mono,
     fontSize: '0.7rem',
     fontWeight: 500,
@@ -53,6 +57,12 @@ export const iconBtn = style([
     },
 ]);
 
+// 圖上顯示類開關（K 棒讀值）：開＝前景色，關＝淡灰
+export const iconBtnToggle = styleVariants({
+    on: [iconBtn, { color: vars.color.foreground }],
+    off: [iconBtn, { opacity: 0.55 }],
+});
+
 export const toolbarDivider = style({
     width: '1px',
     alignSelf: 'stretch',
@@ -61,6 +71,7 @@ export const toolbarDivider = style({
 });
 
 const modeBase = style({
+    whiteSpace: 'nowrap',
     fontFamily: vars.font.body,
     fontSize: '0.66rem',
     fontWeight: 500,
@@ -91,32 +102,6 @@ export const modeBtn = styleVariants({
     ],
 });
 
-// 圖表下單數量 — 緊貼交易模式按鈕群，帶「量」標籤（不再孤懸右側）
-export const qtyWrap = style({
-    display: 'inline-flex',
-    alignItems: 'center',
-    gap: '4px',
-    fontFamily: vars.font.body,
-    fontSize: '0.64rem',
-    color: vars.color.mutedForeground,
-    marginLeft: '2px',
-});
-
-export const qtyInput = style({
-    width: '2.6rem',
-    fontFamily: vars.font.mono,
-    fontSize: '0.7rem',
-    fontWeight: 600,
-    textAlign: 'right',
-    color: vars.color.foreground,
-    background: vars.color.inset,
-    border: `1px solid ${vars.color.border}`,
-    borderRadius: vars.radius.sm,
-    padding: '1px 6px',
-    outline: 'none',
-    ':focus': { borderColor: vars.color.accent },
-});
-
 // 指標按鈕獨立靠右（它屬於圖表工具，不屬於交易模式群）
 export const indicatorBtn = styleVariants({
     normal: [modeBase, { marginLeft: 'auto' }],
@@ -136,7 +121,8 @@ export const modeHint = style({
     top: '8px',
     left: '50%',
     transform: 'translateX(-50%)',
-    zIndex: 5,
+    // 交易／畫圖模式提示疊在左上角圖例與 K 棒讀值之上，不被遮住
+    zIndex: 6,
     fontFamily: vars.font.body,
     fontSize: '0.66rem',
     fontWeight: 600,
@@ -147,11 +133,26 @@ export const modeHint = style({
     pointerEvents: 'none',
 });
 
+// 畫圖模式的提示：與交易模式同一個位置，但用中性的面板色，不搶琥珀
+// 那組「武裝中、下一下會下單」的警示語彙
+export const drawHint = style([
+    modeHint,
+    {
+        color: vars.color.foreground,
+        background: 'color-mix(in srgb, ' + vars.color.panelRaised + ' 92%, transparent)',
+        border: `1px solid ${vars.color.border}`,
+        fontWeight: 500,
+    },
+]);
+
 export const triggerList = style({
     position: 'absolute',
     top: '8px',
     left: '8px',
     zIndex: 5,
+    // 容器本身不吃滑鼠（K 棒讀值列底下的圖表要收得到移動／點擊／觸控）；
+    // 有按鈕的列（委託、觸價、指標圖例）各自恢復
+    pointerEvents: 'none',
     display: 'flex',
     flexDirection: 'column',
     gap: '2px',
@@ -161,6 +162,7 @@ export const triggerList = style({
 });
 
 export const triggerRow = style({
+    pointerEvents: 'auto',
     display: 'flex',
     alignItems: 'center',
     gap: '4px',
@@ -200,10 +202,23 @@ export const triggerRemove = style({
     ':hover': { color: vars.color.danger },
 });
 
+// 左側畫圖工具列與圖表本體並排。工具列佔位而不是浮在圖上 — 浮動會蓋住
+// 最左邊那幾根 K 棒，往左拖載入更舊歷史時特別礙事。
+export const chartRow = style({
+    display: 'flex',
+    flex: 1,
+    minHeight: 0,
+    minWidth: 0,
+});
+
 export const chartHost = style({
     flex: 1,
     minHeight: 0,
+    minWidth: 0,
     position: 'relative',
+    // 點圖表時取得鍵盤焦點（畫圖的 Delete 只在焦點在圖上時作用），
+    // 不畫焦點框
+    outline: 'none',
 });
 
 // ---- indicator legend（TradingView 式，圖上左上角，一列一個實例）----
@@ -341,4 +356,39 @@ export const emptyMsg = style({
     color: vars.color.mutedForeground,
     fontFamily: vars.font.display,
     fontSize: '0.78rem',
+});
+
+// ---- K 棒讀值列（開高低收，issue #240）— 左上角堆疊第一列 ----
+// 整列不吃滑鼠：游標經過讀值列時圖表照樣收到移動／點擊（畫圖、點價不受影響）
+export const ohlcRow = style({
+    display: 'flex',
+    flexWrap: 'wrap',
+    alignItems: 'baseline',
+    columnGap: '8px',
+    rowGap: '1px',
+    padding: '1px 6px',
+    // 最大寬度由元件依圖表寬度給（讓開右側價格軸）；真的放不下才換行
+    width: 'fit-content',
+    background: 'color-mix(in srgb, ' + vars.color.panel + ' 72%, transparent)',
+    borderRadius: vars.radius.sm,
+    fontFamily: vars.font.mono,
+    fontSize: '0.64rem',
+    fontVariantNumeric: 'tabular-nums',
+    color: vars.color.foreground,
+    whiteSpace: 'nowrap',
+    pointerEvents: 'none',
+    userSelect: 'none',
+});
+
+export const ohlcItem = style({
+    display: 'inline-flex',
+    alignItems: 'baseline',
+    gap: '3px',
+    fontWeight: 500,
+});
+
+export const ohlcLabel = style({
+    fontFamily: vars.font.body,
+    fontSize: '0.6rem',
+    color: vars.color.mutedForeground,
 });
