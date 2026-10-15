@@ -3,14 +3,24 @@
 // its quote streams once, and exposes a useSyncExternalStore hook.
 
 import { useSyncExternalStore } from 'react';
-import { resolveContract, subscribeContractQuotes } from './shioaji';
+import { resolveContract } from './shioaji';
 import { registerCodeAlias } from './stream';
+import { prefetchTickBands } from './tick-bands';
 import type { ContractInfo, SecurityType } from './types/contract';
+
+// 期權合約一進 cache 就預取級距表 — 面板首次渲染（要等行情快照）前
+// bands 已就緒，render 期的 lazy prefetch 只是最後防線
+function prefetchBands(c: ContractInfo) {
+    if (
+        (c.security_type === 'FUT' || c.security_type === 'OPT') &&
+        c.tick_rule
+    ) {
+        prefetchTickBands(c.tick_rule, c.security_type);
+    }
+}
 
 const cache = new Map<string, ContractInfo>();
 const pending = new Map<string, Promise<ContractInfo>>();
-const subscribed = new Set<string>();
-const subscriptionPending = new Set<string>();
 const listeners = new Set<() => void>();
 
 function emit() {
@@ -26,24 +36,8 @@ export function primeContract(contract: ContractInfo) {
     if (contract.target_code) {
         registerCodeAlias(contract.target_code, contract.code);
     }
+    prefetchBands(contract);
     emit();
-}
-
-function ensureQuoteSubscription(contract: ContractInfo) {
-    if (
-        subscribed.has(contract.code) ||
-        subscriptionPending.has(contract.code)
-    ) {
-        return;
-    }
-    subscriptionPending.add(contract.code);
-    void subscribeContractQuotes(contract)
-        .then((results) => {
-            if (results.some((result) => result.status === 'fulfilled')) {
-                subscribed.add(contract.code);
-            }
-        })
-        .finally(() => subscriptionPending.delete(contract.code));
 }
 
 export async function refreshCachedContracts(
@@ -97,7 +91,6 @@ export async function ensureContract(
         if (hit.target_code) {
             registerCodeAlias(hit.target_code, hit.code);
         }
-        ensureQuoteSubscription(hit);
         return hit;
     }
     const pendingKey = `${type ?? 'AUTO'}:${code}`;
@@ -113,7 +106,7 @@ export async function ensureContract(
         if (contract.target_code) {
             registerCodeAlias(contract.target_code, contract.code);
         }
-        ensureQuoteSubscription(contract);
+        prefetchBands(contract);
         emit();
         return contract;
     })();

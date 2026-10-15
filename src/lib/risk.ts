@@ -3,12 +3,17 @@
 // flipping the manual lock blocks all order entries.
 
 import { useSyncExternalStore } from 'react';
+import { isOddLot, riskLots } from './odd-lot';
+import { getPrivacyMoney, maskMoney } from './privacy';
+import type { StockOrderLot } from './types/order';
 
 export interface RiskSettings {
     enabled: boolean; // master switch for the rules below
     maxQty: number; // per-order quantity cap (0 = unlimited)
     maxDailyLoss: number; // positive number, TWD (0 = unlimited)
     locked: boolean; // manual kill switch — blocks ALL orders
+    escCancelAll: boolean; // Esc×2 cancels all working orders — opt-in
+    confirmManualOrders: boolean; // 手動下單前跳可視化委託確認 — opt-in
 }
 
 const STORAGE_KEY = 'sj-pro-risk';
@@ -23,17 +28,37 @@ function load(): RiskSettings {
                 maxQty: Number(s.maxQty) || 0,
                 maxDailyLoss: Number(s.maxDailyLoss) || 0,
                 locked: !!s.locked,
+                escCancelAll: !!s.escCancelAll,
+                confirmManualOrders: !!s.confirmManualOrders,
             };
         }
     } catch {
         // defaults
     }
-    return { enabled: false, maxQty: 0, maxDailyLoss: 0, locked: false };
+    return {
+        enabled: false,
+        maxQty: 0,
+        maxDailyLoss: 0,
+        locked: false,
+        escCancelAll: false,
+        confirmManualOrders: false,
+    };
 }
 
 let settings = load();
 let dailyPnl = 0; // fed by App from position/margin polling
+let dailyPnlKnown = false; // the App has read positions and margin at least once
 const listeners = new Set<() => void>();
+
+// cross-window sync — popouts share localStorage but not module state;
+// without this, toggling the kill switch or the Esc-Esc hotkey in one
+// window never reaches already-open popout windows.
+window.addEventListener('storage', (e) => {
+    if (e.key === STORAGE_KEY) {
+        settings = load();
+        emit();
+    }
+});
 
 function emit() {
     listeners.forEach((l) => l());
@@ -45,11 +70,23 @@ export function setRiskSettings(next: Partial<RiskSettings>) {
     emit();
 }
 
-export function reportDailyPnl(pnl: number) {
-    if (pnl !== dailyPnl) {
+/** `known`: computed from positions and margin the App has actually read (0 before that is not a PnL). */
+export function reportDailyPnl(pnl: number, known = true) {
+    if (pnl !== dailyPnl || known !== dailyPnlKnown) {
         dailyPnl = pnl;
+        dailyPnlKnown = known;
         emit();
     }
+}
+
+export function getDailyPnlKnown(): boolean {
+    return dailyPnlKnown;
+}
+
+/** Every change of the settings or the daily PnL (also from other windows). */
+export function subscribeRiskSettings(listener: () => void): () => void {
+    listeners.add(listener);
+    return () => { listeners.delete(listener); };
 }
 
 export function getRiskSettings(): RiskSettings {
@@ -70,17 +107,22 @@ export function useRiskSettings(): RiskSettings {
     );
 }
 
-// returns an error message when the order must be blocked, null when OK
-export function checkOrderAllowed(quantity: number): string | null {
+// returns an error message when the order must be blocked, null when OK.
+// maxQty is set in 張／口; odd lots (股) are compared as a fraction of 張.
+export function checkOrderAllowed(quantity: number, orderLot?: StockOrderLot | string | null): string | null {
     if (settings.locked) {
         return '風控鎖啟動中 — 所有下單已封鎖';
     }
     if (!settings.enabled) return null;
-    if (settings.maxQty > 0 && quantity > settings.maxQty) {
-        return `超過單筆上限 ${settings.maxQty}（本筆 ${quantity}）`;
+    if (settings.maxQty > 0 && riskLots(quantity, orderLot) > settings.maxQty) {
+        return isOddLot(orderLot)
+            ? `超過單筆上限 ${settings.maxQty} 張（本筆 ${quantity} 股）`
+            : `超過單筆上限 ${settings.maxQty}（本筆 ${quantity}）`;
     }
     if (settings.maxDailyLoss > 0 && dailyPnl <= -settings.maxDailyLoss) {
-        return `當日虧損 ${Math.round(dailyPnl)} 已達上限 -${settings.maxDailyLoss}，下單封鎖`;
+        // 這段文字會進 toast 與通知中心：開啟遮金額時不顯示金額
+        const priv = getPrivacyMoney();
+        return `當日虧損 ${maskMoney(String(Math.round(dailyPnl)), priv)} 已達上限 -${maskMoney(String(settings.maxDailyLoss), priv)}，下單封鎖`;
     }
     return null;
 }

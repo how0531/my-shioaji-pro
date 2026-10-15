@@ -1,3 +1,5 @@
+import { RefreshButton } from './refresh-button';
+import { fetchChartHistory, nextChartHistoryRevision } from '../lib/chart-history';
 // src/components/intraday-wall.tsx — 當日走勢牆: a grid of compact
 // intraday (分時) charts driven by a chosen watchlist, with a
 // configurable layout (cols×rows) and paging when the list doesn't fit.
@@ -20,40 +22,40 @@ import {
 } from 'lightweight-charts';
 import { ChevronLeft, ChevronRight, Settings2 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import {
-    resolveScaleMode,
-    type ScaleMode,
-} from './intraday-chart';
-import * as chartUi from './intraday-chart.css';
 import { useQuote } from '../hooks/use-stream';
-import { colorWithOpacity } from '../lib/indicator-defs';
 import { ensureContract } from '../lib/contracts-cache';
+import { colorWithOpacity } from '../lib/indicator-defs';
+import { limitStateOf } from '../lib/limit-state';
 import {
+    CLOSE_GRACE,
     sessionMinutes,
     sessionWindowFor,
     tickBucket,
     type SessionWindow,
 } from '../lib/intraday-session';
 import {
-    fetchKbars,
     fetchSnapshots,
     fetchWatchlists,
-    type ServerWatchlist,
+    type ServerWatchlist
 } from '../lib/shioaji';
-import { getChartColors, useThemeSettings } from '../lib/theme-store';
+import { getChartColors, useThemeSettings, themeKey as themeKeyOf, baseMode } from '../lib/theme-store';
 import type { ContractInfo } from '../lib/types/contract';
 import type { KBars, Snapshot } from '../lib/types/market';
 import { fmtPrice } from '../lib/utils/format';
 import {
     dateStrOffset,
     kbarsToCandles,
+    nowWallClockUtc,
     wallClockToUtc,
 } from '../lib/utils/kbars';
-import { Orb } from './orb';
-import * as panel from './panel.css';
+import {
+    resolveScaleMode,
+    type ScaleMode,
+} from './intraday-chart';
+import * as chartUi from './intraday-chart.css';
 import * as styles from './intraday-wall.css';
-
-const CLOSE_GRACE = 240;
+import { AsyncStatus } from './async-status';
+import * as panel from './panel.css';
 
 // 自訂排列上限：欄 10 × 列 5 = 50 格（訂閱額度與渲染負載的合理天花板）
 const WALL_DIM_MIN = 1;
@@ -219,6 +221,9 @@ function MiniIntraday({
     } | null>(null);
     const loadedRef = useRef('');
     const lastReloadRef = useRef(0);
+    // 換時段重載的目標時段 — 試搓觸發切換時新時段還沒有 kbar，load
+    // 不能又依最後一根 kbar 選回上一段（會空轉重載）
+    const pendingWinRef = useRef<{ code: string; start: number } | null>(null);
     // kbars 快取（30s TTL、快取 in-flight promise）— 顯示設定/主題變更
     // 只需重建圖表，不必重打 API。線寬 slider 拖曳一次可觸發 6+ 次
     // dispKey 變更 × 整頁 cell 數，未快取時實測 36 requests/秒起跳
@@ -234,10 +239,10 @@ function MiniIntraday({
     const quote = useQuote(contract.code);
     const themeSettings = useThemeSettings();
     const colors = getChartColors(themeSettings);
-    const themeKey = `${themeSettings.mode}-${themeSettings.convention}`;
+    const themeKey = themeKeyOf(themeSettings);
     const dispKey = dispKeyOf(disp);
     const isIndex = contract.security_type === 'IND';
-    const avgColor = themeSettings.mode === 'light' ? '#b97f14' : '#e0a43c';
+    const avgColor = baseMode(themeSettings) === 'light' ? '#b97f14' : '#e0a43c';
     const showVol = disp.vol && !isIndex;
     // lightweight-charts 型別標整數，但 renderer 直通 canvas lineWidth，
     // 小數實測有效（與單圖同款 0.5 髮絲線）
@@ -436,43 +441,79 @@ function MiniIntraday({
         setLoading(true);
         setEmpty(false);
         let cancelled = false;
-        const dataKey = `${contract.code}|${reloadSeq}`;
-        const cached = kbarsCacheRef.current;
-        let kbarsP: Promise<KBars>;
-        if (
-            cached &&
-            cached.key === dataKey &&
-            Date.now() - cached.at < 30_000
-        ) {
-            kbarsP = cached.p;
-        } else {
-            kbarsP = fetchKbars(
-                contract,
-                dateStrOffset(4),
-                dateStrOffset(-1),
+        // 價格/美國線/均價/量能資料清空（filler 時段軸另外處理）
+        const clearSeries = () => {
+            priceRef.current?.setData([]);
+            barsRef2.current?.setData([]);
+            avgRef.current?.setData([]);
+            volRef.current?.setData([]);
+        };
+        // 歷史拿不到時開好空的時段框架（參考價/停板/時段軸來自
+        // contract 與現在時間）並讓 loadedRef 成立 — live tick 立刻
+        // 作畫，歷史可手動更新
+        const scaffoldEmptyFrame = () => {
+            if (!priceRef.current || !fillerRef.current) return;
+            // 空框架＝沒有這段的歷史（零 kbars/載入失敗/403）— 先清掉
+            // 圖上殘留的前一次資料（換時段自動重載時是上一段走勢）；
+            // live 累計狀態已歸零，從現在開始重畫
+            clearSeries();
+            const ref = Number(contract.reference);
+            if (!Number.isFinite(ref) || ref <= 0) return;
+            const pend =
+                pendingWinRef.current?.code === contract.code
+                    ? pendingWinRef.current.start
+                    : 0;
+            const win = sessionWindowFor(
+                contract.security_type,
+                pend > 0 ? pend + 60 : nowWallClockUtc(),
             );
-            const entry = { key: dataKey, at: Date.now(), p: kbarsP };
-            kbarsCacheRef.current = entry;
-            // 失敗不留快取 — 下次 dispKey/theme 變更重試
-            kbarsP.catch(() => {
-                if (kbarsCacheRef.current === entry) {
-                    kbarsCacheRef.current = null;
-                }
+            refPriceRef.current = ref;
+            priceRef.current.applyOptions({
+                baseValue: { type: 'price', price: ref },
             });
-        }
+            const minutes = sessionMinutes(win);
+            fillerRef.current.setData(
+                minutes.map((m, i) =>
+                    i === 0 || i === minutes.length - 1
+                        ? { time: m as UTCTimestamp, value: ref }
+                        : { time: m as UTCTimestamp },
+                ),
+            );
+            refLineRef.current?.applyOptions({ price: ref });
+            const lu = Number(contract.limit_up);
+            const ld = Number(contract.limit_down);
+            if (Number.isFinite(lu) && Number.isFinite(ld) && lu > ld && ld > 0) {
+                limitsRef.current = { up: lu, down: ld };
+            }
+            sessionRef.current = win;
+            loadedRef.current = loadKey;
+            chartApiRef.current?.timeScale().fitContent();
+        };
+        const kbarsP = fetchChartHistory(contract, dateStrOffset(4), dateStrOffset(-1), { revision: reloadSeq });
         kbarsP
             .then((k) => {
                 if (cancelled || !priceRef.current) return;
                 const all = kbarsToCandles(k);
                 const last = all[all.length - 1];
-                if (!last) {
+                const pend =
+                    pendingWinRef.current?.code === contract.code
+                        ? pendingWinRef.current.start
+                        : 0;
+                if (!last && !pend) {
+                    // 零 kbars — 開空框架讓 live 直接畫，稍後補歷史
+                    scaffoldEmptyFrame();
                     setEmpty(true);
                     return;
                 }
-                const win = sessionWindowFor(
+                // 資料驅動選時段；換時段重載帶目標時段（試搓/開盤，
+                // 新時段 kbar 未出）時目標較新就用目標
+                let win = sessionWindowFor(
                     contract.security_type,
-                    last.time,
+                    last ? last.time : pend + 60,
                 );
+                if (pend > win.start) {
+                    win = sessionWindowFor(contract.security_type, pend + 60);
+                }
                 const bars = all.filter(
                     (b) =>
                         b.time > win.start &&
@@ -484,7 +525,12 @@ function MiniIntraday({
                 const ref =
                     Number(contract.reference) ||
                     bars[0]?.open ||
-                    last.close;
+                    last?.close ||
+                    0;
+                if (!Number.isFinite(ref) || ref <= 0) {
+                    setEmpty(true);
+                    return;
+                }
                 refPriceRef.current = ref;
                 const lu = Number(contract.limit_up);
                 const ld = Number(contract.limit_down);
@@ -612,7 +658,10 @@ function MiniIntraday({
                 chartApiRef.current?.timeScale().fitContent();
             })
             .catch(() => {
-                if (!cancelled) setEmpty(true);
+                if (cancelled) return;
+                // 失敗 — 開空框架讓 live 直接畫，歷史由使用者手動更新
+                scaffoldEmptyFrame();
+                setEmpty(true);
             })
             .finally(() => {
                 if (!cancelled) setLoading(false);
@@ -626,7 +675,6 @@ function MiniIntraday({
     const liveQuote = quote?.tick ?? quote?.index;
     useEffect(() => {
         if (!liveQuote || liveQuote.code !== contract.code) return;
-        if ('simtrade' in liveQuote && liveQuote.simtrade) return;
         if (
             loadedRef.current !==
             `${contract.code}|${reloadSeq}|${themeKey}|${dispKey}`
@@ -636,20 +684,27 @@ function MiniIntraday({
         const win = sessionRef.current;
         const series = priceRef.current;
         if (!win || !series) return;
-        const p = Number(liveQuote.close);
-        if (!Number.isFinite(p) || p <= 0) return;
         const t = wallClockToUtc(`${liveQuote.date}T${liveQuote.time}`);
+        // 換時段（試搓 tick 也算數 — 08:30 就切新時段框架）
         if (t > win.end + CLOSE_GRACE) {
             const next = sessionWindowFor(contract.security_type, t);
             if (
                 next.start !== win.start &&
                 Date.now() - lastReloadRef.current > 30_000
             ) {
+                pendingWinRef.current = {
+                    code: contract.code,
+                    start: next.start,
+                };
                 lastReloadRef.current = Date.now();
-                setReloadSeq((v) => v + 1);
+                setReloadSeq(nextChartHistoryRevision());
             }
             return;
         }
+        // 試撮揭示價可以是天地價 — 只允許觸發換時段，不入圖
+        if ('simtrade' in liveQuote && liveQuote.simtrade) return;
+        const p = Number(liveQuote.close);
+        if (!Number.isFinite(p) || p <= 0) return;
         if (t <= win.start) return;
         const label = tickBucket(win, t);
         if (label < lastLabelRef.current) return;
@@ -717,20 +772,25 @@ function MiniIntraday({
         } catch {
             // series torn down mid-update — ignore
         }
+        // 空時段框架收到第一筆成交 → 清空狀態（同值 setState 無代價）
+        setEmpty(false);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [liveQuote, contract.code]);
 
     return (
         <div className={styles.cellChart}>
+            {empty && !loading && <div className={styles.refreshAction}>
+                <RefreshButton label="更新歷史" loading={loading} onClick={() => setReloadSeq(nextChartHistoryRevision())} />
+            </div>}
             <div ref={hostRef} style={{ position: 'absolute', inset: 0 }} />
             {loading && (
                 <div className={styles.centerMsg} style={{ position: 'absolute', inset: 0 }}>
-                    <Orb size={10} />
+                    <AsyncStatus phase='loading' size={10} text='載入走勢…' />
                 </div>
             )}
             {empty && !loading && (
                 <div className={styles.centerMsg} style={{ position: 'absolute', inset: 0 }}>
-                    <span className={panel.mono}>無資料</span>
+                    <AsyncStatus phase='empty' text='無資料' className={panel.mono} />
                 </div>
             )}
         </div>
@@ -771,18 +831,13 @@ function CellHead({
             : null;
     const dir =
         chgPct === null || chgPct === 0 ? 'flat' : chgPct > 0 ? 'up' : 'down';
-    const locked =
-        hasPx && contract.limit_up > contract.limit_down && contract.limit_down > 0
-            ? price >= contract.limit_up
-                ? ('up' as const)
-                : price <= contract.limit_down
-                  ? ('down' as const)
-                  : null
-            : null;
+    const locked = hasPx ? limitStateOf(contract, price) : null;
+    const isSim = !!quote?.tick?.simtrade;
     return (
         <div className={styles.cellHead}>
             <span className={styles.cellCode}>{contract.code}</span>
             <span className={styles.cellName}>{contract.name}</span>
+            {isSim && <span className={styles.cellSim}>試搓</span>}
             <span
                 className={
                     locked
@@ -1001,8 +1056,7 @@ export function IntradayWallPanel({
         return (
             <div className={styles.wrap}>
                 <div className={styles.centerMsg}>
-                    <Orb size={12} />
-                    <span className={panel.mono}>載入自選清單…</span>
+                    <AsyncStatus phase='loading' text='載入自選清單…' className={panel.mono} />
                 </div>
             </div>
         );

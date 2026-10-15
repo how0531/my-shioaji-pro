@@ -1,0 +1,224 @@
+import { useSyncExternalStore } from 'react';
+import { getApiBase } from './runtime';
+import type { ServerInfo } from './shioaji';
+
+// Observe existing info requests; displaying compatibility notices must not
+// create another polling loop or account query.
+//
+// Requests are ordered per API base: a response (success or failure) that
+// settles after a newer request for the same base has already been applied
+// is dropped, so a slow first /info call cannot overwrite fresher info and a
+// late failure cannot blank a newer success. Responses for a base that is no
+// longer current are ignored (server switch isolation).
+export interface ServerInfoRequest {
+    readonly base: string;
+    readonly sequence: number;
+}
+
+const infos = new Map<string, ServerInfo>();
+const applied = new Map<string, number>();
+const listeners = new Set<() => void>();
+let sequence = 0;
+let modeVersion = 0;
+let observations = 0;
+// base → request sequence of the latest successful /info applied there
+const freshest = new Map<string, number>();
+let activeBase: string | undefined;
+let channel: BroadcastChannel | null = null;
+
+// Reuse the existing account-state broadcast transport. A long-lived popout
+// must retire its /info requests even when the main reloads on the same port.
+function syncBase() {
+    const base = getApiBase();
+    if (activeBase === base) return base;
+    if (activeBase !== undefined) {
+        modeVersion += 1;
+        channel?.postMessage({ kind: 'server-info-invalidated', base: activeBase });
+        sequence += 1;
+        infos.clear();
+        applied.clear();
+        applied.set(base, sequence);
+    }
+    channel?.close();
+    activeBase = base;
+    channel = typeof window === 'undefined' || typeof BroadcastChannel === 'undefined' ? null : new BroadcastChannel(`sj-trading-state:${base}`);
+    channel?.addEventListener('message', event => {
+        if (event.data?.base !== base || base !== getApiBase()) return;
+        if (event.data?.kind === 'server-info-invalidated') invalidate(base);
+        // 另一個視窗得知的模式與這裡已知的不同：這裡的副本過時了
+        else if (event.data?.kind === 'server-mode-observed') {
+            const mine = infos.get(base)?.simulation;
+            if (typeof mine === 'boolean' && typeof event.data.simulation === 'boolean' && mine !== event.data.simulation) invalidate(base);
+        }
+    });
+    return base;
+}
+
+function invalidate(base: string) {
+    modeVersion += 1;
+    sequence += 1;
+    applied.set(base, sequence);
+    infos.delete(base);
+    for (const listener of listeners) listener();
+}
+
+export function beginServerInfoRequest(): ServerInfoRequest {
+    const base = syncBase();
+    sequence += 1;
+    return { base, sequence };
+}
+
+export function observeServerInfo(request: ServerInfoRequest, info: ServerInfo | undefined) {
+    const { base } = request;
+    if (base !== syncBase()) return;
+    if ((applied.get(base) ?? 0) > request.sequence) return;
+    const previous = infos.get(base)?.simulation;
+    if (previous !== info?.simulation) modeVersion += 1;
+    // 已知模式變了（例如同一位址的 sidecar 由模擬重啟成正式）：通知其他視窗
+    // （彈出視窗）作廢它們的副本，開著的確認與送單閘門因此不算同一個
+    // 已知模式因 /info 失敗而變成未知也一樣廣播（之後恢復時可能已是正式）
+    if (typeof previous === 'boolean' && previous !== info?.simulation) {
+        channel?.postMessage({ kind: 'server-info-invalidated', base });
+    }
+    // 第一次得知（或改變）模式也告訴其他視窗；模式不同的視窗會作廢自己的副本
+    if (typeof info?.simulation === 'boolean' && previous !== info.simulation) {
+        channel?.postMessage({ kind: 'server-mode-observed', base, simulation: info.simulation });
+    }
+    applied.set(base, request.sequence);
+    if (info) { observations += 1; freshest.set(base, request.sequence); }
+    else freshest.delete(base);
+    if (info) infos.set(base, info);
+    else infos.delete(base);
+    for (const listener of listeners) listener();
+}
+
+/** Drop what is known for `base` (e.g. the stream went down: the sidecar may
+ * be restarting in another mode on the same port). Responses to requests
+ * started before this are ignored; only a fresh /info repopulates it. */
+export function forgetServerInfo(base: string) {
+    syncBase();
+    // Publish even if this freshly reloaded main has no local cache yet.
+    channel?.postMessage({ kind: 'server-info-invalidated', base });
+    invalidate(base);
+}
+
+function forgetCurrentServerInfo() { forgetServerInfo(syncBase()); }
+function onStorage(event: StorageEvent) {
+    if (event.key === 'sj-pro-api-port' || event.key === 'sj-pro-api-scheme') forgetCurrentServerInfo();
+}
+if (typeof window !== 'undefined') {
+    window.addEventListener('sj-pro-api-base-changed', forgetCurrentServerInfo);
+    window.addEventListener('storage', onStorage);
+}
+import.meta.hot?.dispose(() => {
+    channel?.close();
+    if (typeof window !== 'undefined') {
+        window.removeEventListener('sj-pro-api-base-changed', forgetCurrentServerInfo);
+        window.removeEventListener('storage', onStorage);
+    }
+});
+
+// Hoisted so useSyncExternalStore keeps one subscription per component instead
+// of re-subscribing on every render.
+export function subscribeServerInfo(listener: () => void) {
+    listeners.add(listener);
+    return () => { listeners.delete(listener); };
+}
+function currentServerInfo() { return infos.get(syncBase()); }
+/** Last /info observed for the current API base, without a new request. */
+export const knownServerInfo = currentServerInfo;
+
+/** Changes of mode or server invalidate in-flight accounting responses,
+ * including a switch away and back while a request is waiting. */
+/** 確認或送單期間伺服器或模式變了（例如模擬 sidecar 重啟成正式）的白話原因 */
+export const SERVER_MODE_CHANGED_MESSAGE = '確認期間伺服器或模式已變更，這筆沒有送出，請重新下單';
+
+/**
+ * 送單閘門：記下開始時的伺服器與模式代次，回傳「是否仍是同一個」的檢查。
+ * - 換了 API 位址 → 不同。
+ * - 開始時已知模式 → 代次必須沒變（中間任何模式變化或資訊被清掉，例如
+ *   模擬→正式→模擬、同位址重啟後恢復同一模式，都永久失效）。
+ * - 開始時模式未知 → 代次沒變，或只多了一次「第一次得知是模擬」才算相同
+ *   （確認視窗自己第一次取得 /info 不會誤擋模擬單；變成正式一律不送）。
+ */
+export interface ServerModeGuard {
+    (): boolean;
+    /** 開始時模式未知、已經過使用者確認（確認視窗自己會守到按下確認）：
+     * 改以目前的伺服器與模式為準，之後再變就不送。避免冷啟動第一筆正式單
+     * 因確認視窗第一次取得模式而被誤擋。 */
+    rebaseIfUnknown(): void;
+    /** 目前記下的位址、模式與代次 */
+    snapshot(): ServerModeSnapshot;
+    /** 開始時模式未知：改以使用者按下確認當下（確認視窗）記下的狀態為準，
+     * 只在同一位址；之後任何變化都不算同一個 */
+    rebaseTo(snap: ServerModeSnapshot): void;
+}
+
+export interface ServerModeSnapshot { base: string; simulation: boolean | undefined; version: number }
+
+export function captureServerMode(): ServerModeGuard {
+    const base = syncBase();
+    let simulation = infos.get(base)?.simulation;
+    let version = modeVersion;
+    const same = (() => {
+        const now = syncBase();
+        if (now !== base) return false;
+        const current = infos.get(now)?.simulation;
+        if (typeof simulation === 'boolean') return modeVersion === version && current === simulation;
+        return modeVersion === version || (modeVersion === version + 1 && current === true);
+    }) as ServerModeGuard;
+    same.rebaseIfUnknown = () => {
+        // 只在同一個位址上改以目前的模式為準；換了位址永遠不算同一個
+        if (typeof simulation === 'boolean' || syncBase() !== base) return;
+        simulation = infos.get(base)?.simulation;
+        version = modeVersion;
+    };
+    same.snapshot = () => ({ base, simulation, version });
+    same.rebaseTo = snap => {
+        if (typeof simulation === 'boolean' || snap.base !== base || typeof snap.simulation !== 'boolean') return;
+        simulation = snap.simulation;
+        version = snap.version;
+    };
+    return same;
+}
+
+/** 目前的請求序號：之後才開始的 /info 請求序號都比它大 */
+export function currentServerInfoSequence() {
+    syncBase();
+    return sequence;
+}
+
+/** 目前位址的模式是否來自 `afterSequence` 之後才開始的 /info 請求（舊請求的回應不算） */
+export function serverInfoFreshSince(afterSequence: number): boolean {
+    const base = syncBase();
+    return (freshest.get(base) ?? -1) > afterSequence && typeof infos.get(base)?.simulation === 'boolean';
+}
+
+/** 成功取得 /info 的次數（同一模式也會增加）：確認視窗用來判斷「有新的回應」 */
+export function getServerInfoObservations() {
+    syncBase();
+    return observations;
+}
+
+export function getServerModeVersion() {
+    syncBase();
+    return modeVersion;
+}
+
+export function useServerInfo() {
+    return useSyncExternalStore(subscribeServerInfo, currentServerInfo);
+}
+
+// Versions whose simulation yd_quantity was verified to follow the position
+// unit. Empty until Sinotrade/Shioaji#233 is fixed and re-verified read-only.
+const YD_QUANTITY_UNIT_FIXED = new Set<string>();
+
+export function yesterdayQuantityNotice(info: Pick<ServerInfo, 'version' | 'simulation'> | undefined): string | undefined {
+    if (!info) return '尚未取得伺服器資訊；昨餘單位待確認。';
+    // Sinotrade/Shioaji#233 (app #107): simulation yd_quantity does not follow
+    // the Common/Share unit (read-only reproduced on 1.7.5 and 1.7.6). Warn in
+    // simulation unless the version is known fixed; never assume a bump fixed it.
+    return info.simulation === true && !YD_QUANTITY_UNIT_FIXED.has(info.version)
+        ? `Shioaji ${info.version} 模擬帳務的昨餘單位待確認；保留 API 原值，不推算張／股。`
+        : undefined;
+}

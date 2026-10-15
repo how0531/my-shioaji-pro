@@ -331,6 +331,21 @@ export const PANEL_PREVIEWS: Record<BlockType, ReactNode> = {
             ))}
         </Frame>
     ),
+    // 整零價差：上方兩張試算卡，下方左整股、右零股的共用價格梯
+    oddspread: (
+        <Frame>
+            <rect x='8' y='8' width='50' height='20' rx='2' fill={vars.color.success} fillOpacity='0.25' stroke={vars.color.success} strokeOpacity='0.8' />
+            <rect x='62' y='8' width='50' height='20' rx='2' fill={muted} fillOpacity='0.15' />
+            {[0, 1, 2, 3, 4].map((i) => (
+                <g key={i}>
+                    {i < 2 && <rect x='8' y={34 + i * 7} width='104' height='6' fill={vars.color.amber} fillOpacity='0.18' />}
+                    <rect x={i < 3 ? 34 : 14} y={35 + i * 7} width={12 + i * 3} height='4' fill={i < 3 ? down : up} fillOpacity='0.75' />
+                    <rect x='54' y={35 + i * 7} width='12' height='4' fill={muted} fillOpacity='0.5' />
+                    <rect x='72' y={35 + i * 7} width={10 + ((i * 7) % 12)} height='4' fill={up} fillOpacity='0.75' />
+                </g>
+            ))}
+        </Frame>
+    ),
     pnl: (
         <Frame>
             <polyline
@@ -490,6 +505,56 @@ export const PANEL_PREVIEWS: Record<BlockType, ReactNode> = {
                 strokeWidth='1.5'
             />
             <rect x='88' y='31' width='20' height='14' rx='3' fill={accent} fillOpacity='0.6' />
+        </Frame>
+    ),
+    combolist: (
+        <Frame>
+            {[18, 32, 46, 60].map((y, i) => (
+                <g key={y}>
+                    <rect
+                        x='10'
+                        y={y - 4}
+                        width='34'
+                        height='8'
+                        rx='2'
+                        fill={muted}
+                        fillOpacity='0.5'
+                    />
+                    <rect
+                        x='52'
+                        y={y - 4}
+                        width='22'
+                        height='8'
+                        rx='2'
+                        fill={up}
+                        fillOpacity={0.75 - i * 0.12}
+                    />
+                    <rect
+                        x='80'
+                        y={y - 4}
+                        width='22'
+                        height='8'
+                        rx='2'
+                        fill={down}
+                        fillOpacity={0.75 - i * 0.12}
+                    />
+                </g>
+            ))}
+        </Frame>
+    ),
+    conditional: (
+        <Frame>
+            <Ln x={8} y={9} w={40} color={accent} o={0.8} />
+            <rect x='8' y='18' width='104' height='11' rx='2' fill={down} fillOpacity='0.12' />
+            <Ln x={12} y={22} w={26} />
+            <Ln x={70} y={22} w={30} color={down} o={0.9} />
+            {[0, 1, 2].map((i) => (
+                <g key={i}>
+                    <Ln x={12} y={38 + i * 12} w={26} />
+                    <Ln x={46} y={38 + i * 12} w={20} o={0.35} />
+                    <Ln x={78} y={38 + i * 12} w={18} color={accent} o={0.7} />
+                </g>
+            ))}
         </Frame>
     ),
     notices: (

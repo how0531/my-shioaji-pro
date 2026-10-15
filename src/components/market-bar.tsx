@@ -1,20 +1,25 @@
 // src/components/market-bar.tsx — index / futures basis strip in the header
 
 import { useCallback } from 'react';
-import { usePoll } from '../hooks/use-poll';
+import { useQuery } from '../hooks/use-query';
 import { useQuote } from '../hooks/use-stream';
+import { ensureContract } from '../lib/contracts-cache';
 import { useHeaderItems } from '../lib/header-items';
 import { fetchSnapshots } from '../lib/shioaji';
-import { ensureContract } from '../lib/contracts-cache';
 import type { Snapshot } from '../lib/types/market';
 import { fmtPct, fmtPrice, fmtSigned } from '../lib/utils/format';
-import * as panel from './panel.css';
 import * as styles from './hud-header.css';
+import * as panel from './panel.css';
 
 export function MarketBar() {
     // 頂欄自訂：加權/基差 chips 可各自關閉（settings → 外觀 → 頂欄顯示）
     const headerItems = useHeaderItems();
-    const { data } = usePoll<Snapshot[]>(
+    if (!headerItems.marketIndex && !headerItems.marketBasis) return null;
+    return <VisibleMarketBar />;
+}
+function VisibleMarketBar() {
+    const headerItems = useHeaderItems();
+    const { data } = useQuery<Snapshot[]>(
         useCallback(async () => {
             const contracts = await Promise.all([
                 ensureContract('IX0001', 'IND'),
@@ -22,7 +27,7 @@ export function MarketBar() {
             ]);
             return fetchSnapshots(contracts);
         }, []),
-        10000,
+        'header-market-snapshots',
     );
     const indexLive = useQuote('IX0001');
     const txfLive = useQuote('TXFR1');
@@ -67,7 +72,7 @@ export function MarketBar() {
     return (
         <>
             {headerItems.marketIndex && (
-                <div className={styles.chip}>
+                <div className={`${styles.chip} ${styles.infoAutoHide.last}`}>
                     <span className={styles.chipLabel}>加權</span>
                     <span className={panel.dirText[dir]}>
                         {fmtPrice(indexClose)} {fmtPct(indexPct)}
@@ -75,7 +80,10 @@ export function MarketBar() {
                 </div>
             )}
             {headerItems.marketBasis && basis !== undefined && (
-                <div className={styles.chip} title='台指期 − 加權指數（價差）'>
+                <div
+                    className={`${styles.chip} ${styles.infoAutoHide.first}`}
+                    title='台指期 − 加權指數（價差）'
+                >
                     <span className={styles.chipLabel}>基差</span>
                     <span className={panel.dirText[basisDir]}>
                         {fmtSigned(basis, 0)}

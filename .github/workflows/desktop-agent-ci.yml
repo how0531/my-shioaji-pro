@@ -1,0 +1,64 @@
+# Desktop agent 合成測試（Linux/Windows）。實際步驟定義在
+# desktop-agent-build.yml（reusable workflow），與 fork PR 的維護者核准路徑
+# desktop-agent-ci-fork.yml 共用。
+#
+# 外部 fork 的 PR 拿不到 AGENT_SSH_KEY，這裡不跑私有合成測試（job 顯示
+# skipped，不是紅叉），改由 fork-notice 寫 job summary 說明：需維護者 review
+# 後加 `run-desktop-ci` label 才會跑完整 desktop CI。公開 build／test
+# （ci.yml、web-build.yml）對 fork PR 照常執行。
+name: desktop-agent-ci
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  # PR updates replace older runs of that PR; manual runs cannot cancel PR checks.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  combined-agent:
+    # fork PR 沒有 secrets — 乾淨 skip，交給 desktop-agent-ci-fork.yml
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/desktop-agent-build.yml
+    with:
+      untrusted: false
+    secrets:
+      AGENT_SSH_KEY: ${{ secrets.AGENT_SSH_KEY }}
+
+  fork-notice:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Explain maintainer-gated desktop CI
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'MD'
+          ## Desktop agent CI：需要維護者核准
+
+          這個 PR 來自外部 fork。完整的桌面合成測試需要私有模組（唯讀 deploy key），
+          基於安全考量不會自動對 fork 程式碼執行，因此 `combined-agent` 顯示為 **skipped**，
+          這不代表失敗。
+
+          - 公開檢查（`CI / checks`、`web-build`）已照常執行，merge 只需要它們綠燈。
+          - 維護者 review 過程式碼、Approve 目前 head 後，會加上 **`run-desktop-ci`** label 觸發完整 desktop CI
+            （`desktop-agent-ci-fork`），結果會出現在這個 PR 的 checks。
+          - 之後每次 push 新 commit，label 會自動移除，需要維護者重新 review 再加一次。
+
+          ---
+
+          **English:** This PR comes from a fork, so the private desktop CI (`combined-agent`)
+          is skipped, not failed. Public checks (`CI / checks`, `web-build`) still run.
+          A maintainer will review the code and add the `run-desktop-ci` label to run the full
+          desktop CI; the label is removed automatically on every new push.
+          MD
+          echo "::notice title=Desktop CI needs maintainer approval::Fork PR — a maintainer must add label 'run-desktop-ci' to run the full desktop CI."

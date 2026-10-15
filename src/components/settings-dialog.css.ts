@@ -118,3 +118,27 @@ export const unsignedTag = style({
     fontSize: '0.6rem',
     color: vars.color.amber,
 });
+
+export const signLinks = style({
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: '4px 12px',
+    marginTop: '4px',
+});
+
+export const signLink = style({
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: '3px',
+    color: vars.color.accent,
+    textDecoration: 'none',
+    selectors: {
+        '&:hover': { textDecoration: 'underline' },
+    },
+});
+
+export const errorText = style({
+    fontSize: '0.68rem',
+    color: vars.color.danger,
+    whiteSpace: 'pre-wrap',
+});
